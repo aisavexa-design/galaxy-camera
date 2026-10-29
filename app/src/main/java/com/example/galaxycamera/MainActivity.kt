@@ -82,6 +82,11 @@ class MainActivity : Activity() {
     private var nv21Buffer: ByteArray? = null
     private val debugLines = ArrayList<String>()
 
+    private var imageProcessor: ImageProcessor? = null
+    private val processorLog: (String, String, Throwable?) -> Unit = { step, msg, t ->
+        if (t != null) logError(step, t) else logMsg(step, msg)
+    }
+
     // ------------------------------------------------------------------
     // Lifecycle
     // ------------------------------------------------------------------
@@ -357,9 +362,10 @@ class MainActivity : Activity() {
         setContentView(rootView)
     }
 
-    private fun showSavedToast() {
+    private fun showToast(message: String) {
         runOnUiThread {
             toastText.animate().cancel()
+            toastText.text = message
             toastText.alpha = 0f
             toastText.animate().alpha(1f).setDuration(200).withEndAction {
                 toastText.postDelayed({
@@ -583,7 +589,7 @@ class MainActivity : Activity() {
     }
 
     // ------------------------------------------------------------------
-    // Saving frames
+    // Saving frames and Stage 2 processing
     // ------------------------------------------------------------------
 
     private val onImageAvailableListener = ImageReader.OnImageAvailableListener { reader ->
@@ -607,21 +613,21 @@ class MainActivity : Activity() {
                 try {
                     saveFrame(image, count, dir)
                     if (count == 10) {
-                        burstInProgress.set(false)
-                        showSavedToast()
+                        processBurst(dir)
                     }
                 } catch (e: Throwable) {
                     logError("saveFrame " + count, e)
-                    if (count == 10) burstInProgress.set(false)
                 } finally {
                     try {
                         image.close()
                     } catch (e: Throwable) {
                     }
+                    if (count == 10) burstInProgress.set(false)
                 }
             }
         } catch (e: Throwable) {
             image.close()
+            burstInProgress.set(false)
             logError("executor", e)
         }
     }
@@ -637,11 +643,39 @@ class MainActivity : Activity() {
             val jpegBytes = yuvToJpeg(image)
             FileOutputStream(file).use { it.write(jpegBytes) }
         }
-
         applyExifOrientation(file)
+    }
 
-        if (index == 1) {
-            saveToGallery(file.readBytes(), file.name)
+    private fun processBurst(dir: File) {
+        try {
+            val frames = (1..10)
+                .map { File(dir, String.format(Locale.US, "frame_%02d.jpg", it)) }
+                .filter { it.exists() }
+            if (frames.isEmpty()) {
+                logMsg("process", "no frames found")
+                return
+            }
+            showToast("Processing...")
+
+            val enhDir = File(getExternalFilesDir(null) ?: filesDir, "enhanced")
+            enhDir.mkdirs()
+            val outName = "GC_" + System.currentTimeMillis() + "_enhanced.jpg"
+            val outFile = File(enhDir, outName)
+
+            val processor = imageProcessor ?: ImageProcessor(processorLog).also { imageProcessor = it }
+            val result = processor.process(frames, outFile)
+
+            applyExifOrientation(result.file)
+            saveToGallery(result.file.readBytes(), outName)
+
+            if (result.usedFallback) {
+                showToast("Saved sharpest frame (enhancement failed)")
+            } else {
+                showToast("Enhanced photo saved")
+            }
+        } catch (e: Throwable) {
+            logError("processBurst", e)
+            showToast("Processing failed, see log")
         }
     }
 
