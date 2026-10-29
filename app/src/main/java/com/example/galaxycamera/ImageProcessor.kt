@@ -1,338 +1,380 @@
 package com.example.galaxycamera
 
-import android.content.ContentValues
-import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
-import android.os.Environment
-import android.provider.MediaStore
+import android.graphics.BitmapRegionDecoder
+import android.graphics.Rect
 import java.io.File
 import java.io.FileOutputStream
-import java.util.concurrent.ArrayBlockingQueue
-import java.util.concurrent.ThreadPoolExecutor
-import java.util.concurrent.TimeUnit
 import kotlin.math.abs
+import kotlin.math.floor
 import kotlin.math.max
 import kotlin.math.min
 
-class ImageProcessor {
-    private val executor = ThreadPoolExecutor(1, 1, 0L, TimeUnit.MILLISECONDS, ArrayBlockingQueue(3))
+class ImageProcessor(private val log: (String, Throwable?) -> Unit) {
 
-    fun enqueue(dir: File, timestamp: String, context: Context, callback: (String) -> Unit): Boolean {
-        return try {
-            executor.execute { processBurst(dir, timestamp, context, callback) }
-            true
-        } catch (e: Exception) {
-            false
-        }
+    class Result(val file: File, val usedFallback: Boolean)
+
+    private class Gray(val w: Int, val h: Int, val v: IntArray)
+    private class Shift(val idx: Int, val dx: Int, val dy: Int)
+
+    companion object {
+        private const val BAND = 128
+        private const val GHOST_THRESH = 40
+        private const val ALIGN_MAX_ERR = 30.0
     }
 
-    private fun processBurst(dir: File, timestamp: String, context: Context, callback: (String) -> Unit) {
-        val files = dir.listFiles { _, name -> name.endsWith(".jpg") }?.sorted() ?: return
-        if (files.isEmpty()) return
-        
+    fun process(frames: List<File>, outFile: File): Result {
+        var fallbackIdx = 0
         try {
-            val w = 4080
-            val h = 3060
-            
-            val smallOpts = BitmapFactory.Options().apply { inSampleSize = 8 }
-            var bestIdx = 0
-            var maxVar = -1f
-            val smallBitmaps = Array<Bitmap?>(files.size) { null }
-            
-            for (i in files.indices) {
-                val bmp = BitmapFactory.decodeFile(files[i].absolutePath, smallOpts) ?: continue
-                smallBitmaps[i] = bmp
-                val v = getLaplacianVariance(bmp)
-                if (v > maxVar) { maxVar = v; bestIdx = i }
+            val g4 = frames.map { loadGray(it, 4) }
+            var best = 0
+            var bestSharp = -1.0
+            for (i in g4.indices) {
+                val s = sharpness(g4[i])
+                if (s > bestSharp) {
+                    bestSharp = s
+                    best = i
+                }
             }
-            
-            val refSmall = smallBitmaps[bestIdx] ?: return
-            val offsets = Array(files.size) { Pair(0, 0) }
-            for (i in files.indices) {
-                if (i == bestIdx || smallBitmaps[i] == null) continue
-                offsets[i] = alignFrames(refSmall, smallBitmaps[i]!!)
-            }
-            smallBitmaps.forEach { it?.recycle() }
-            
-            val mergedR = IntArray(w * h)
-            val mergedG = IntArray(w * h)
-            val mergedB = IntArray(w * h)
-            val counts = ByteArray(w * h)
-            
-            val fullOpts = BitmapFactory.Options().apply { inMutable = true }
-            var refBitmap = BitmapFactory.decodeFile(files[bestIdx].absolutePath, fullOpts)
-            val refPixels = IntArray(w * h)
-            refBitmap.getPixels(refPixels, 0, w, 0, 0, w, h)
-            
-            for (i in 0 until w * h) {
-                val p = refPixels[i]
-                mergedR[i] = (p shr 16) and 0xFF
-                mergedG[i] = (p shr 8) and 0xFF
-                mergedB[i] = p and 0xFF
-                counts[i] = 1
-            }
-            
-            var reuseBitmap: Bitmap? = refBitmap
-            for (i in files.indices) {
-                if (i == bestIdx) continue
-                fullOpts.inBitmap = reuseBitmap
-                val bmp = BitmapFactory.decodeFile(files[i].absolutePath, fullOpts) ?: continue
-                reuseBitmap = bmp
-                
-                val dx = offsets[i].first * 8
-                val dy = offsets[i].second * 8
-                val px = IntArray(w * h)
-                bmp.getPixels(px, 0, w, 0, 0, w, h)
-                
-                for (y in 0 until h) {
-                    val sy = y - dy
-                    if (sy !in 0 until h) continue
-                    for (x in 0 until w) {
-                        val sx = x - dx
-                        if (sx !in 0 until w) continue
-                        val srcP = px[sy * w + sx]
-                        val refP = refPixels[y * w + x]
-                        
-                        val sr = (srcP shr 16) and 0xFF
-                        val sg = (srcP shr 8) and 0xFF
-                        val sb = srcP and 0xFF
-                        val rr = (refP shr 16) and 0xFF
-                        val rg = (refP shr 8) and 0xFF
-                        val rb = refP and 0xFF
-                        
-                        if (abs(sr - rr) + abs(sg - rg) + abs(sb - rb) < 60) {
-                            val idx = y * w + x
-                            mergedR[idx] += sr
-                            mergedG[idx] += sg
-                            mergedB[idx] += sb
-                            counts[idx]++
+            fallbackIdx = best
+            log("sharp", "reference frame " + (best + 1))
+
+            val ref4 = g4[best]
+            val ref2 = loadGray(frames[best], 2)
+            val aligned = ArrayList<Shift>()
+            aligned.add(Shift(best, 0, 0))
+
+            for (k in frames.indices) {
+                if (k == best) continue
+                var bdx = 0
+                var bdy = 0
+                var be = Double.MAX_VALUE
+                for (dy in -16..16) {
+                    for (dx in -16..16) {
+                        val e = avgError(ref4, g4[k], dx, dy, 4)
+                        if (e < be) {
+                            be = e
+                            bdx = dx
+                            bdy = dy
                         }
                     }
                 }
-            }
-            reuseBitmap?.recycle()
-            
-            val mergedPixels = IntArray(w * h)
-            for (i in 0 until w * h) {
-                val c = counts[i].toInt()
-                val r = mergedR[i] / c
-                val g = mergedG[i] / c
-                val b = mergedB[i] / c
-                mergedPixels[i] = (0xFF shl 24) or (r shl 16) or (g shl 8) or b
-            }
-            
-            val finalPixels = IntArray(w * h)
-            for (y in 0 until h) {
-                for (x in 0 until w) {
-                    val idx = y * w + x
-                    val p = mergedPixels[idx]
-                    var r = (p shr 16) and 0xFF
-                    var g = (p shr 8) and 0xFF
-                    var b = p and 0xFF
-                    
-                    if (x in 1 until w - 1 && y in 1 until h - 1) {
-                        val blurR = ((mergedPixels[idx - 1] shr 16 and 0xFF) + (mergedPixels[idx + 1] shr 16 and 0xFF) + (mergedPixels[idx - w] shr 16 and 0xFF) + (mergedPixels[idx + w] shr 16 and 0xFF) + r * 4) / 8
-                        val blurG = ((mergedPixels[idx - 1] shr 8 and 0xFF) + (mergedPixels[idx + 1] shr 8 and 0xFF) + (mergedPixels[idx - w] shr 8 and 0xFF) + (mergedPixels[idx + w] shr 8 and 0xFF) + g * 4) / 8
-                        val blurB = ((mergedPixels[idx - 1] and 0xFF) + (mergedPixels[idx + 1] and 0xFF) + (mergedPixels[idx - w] and 0xFF) + (mergedPixels[idx + w] and 0xFF) + b * 4) / 8
-                        
-                        val diff = abs(r - blurR) + abs(g - blurG) + abs(b - blurB)
-                        val amount = if (diff > 15) 0.8f else 0.2f
-                        r = clamp((r + amount * (r - blurR)).toInt())
-                        g = clamp((g + amount * (g - blurG)).toInt())
-                        b = clamp((b + amount * (b - blurB)).toInt())
-                    }
-                    
-                    val maxC = max(r, max(g, b)).toFloat()
-                    val minC = min(r, min(g, b)).toFloat()
-                    val delta = maxC - minC
-                    var hue = 0f
-                    if (delta > 0) {
-                        hue = when (maxC) {
-                            r.toFloat() -> 60f * (((g - b) / delta) % 6f)
-                            g.toFloat() -> 60f * (((b - r) / delta) + 2f)
-                            else -> 60f * (((r - g) / delta) + 4f)
+                val cur2 = loadGray(frames[k], 2)
+                var rdx = bdx * 2
+                var rdy = bdy * 2
+                var re = Double.MAX_VALUE
+                for (dy in (bdy * 2 - 3)..(bdy * 2 + 3)) {
+                    for (dx in (bdx * 2 - 3)..(bdx * 2 + 3)) {
+                        val e = avgError(ref2, cur2, dx, dy, 2)
+                        if (e < re) {
+                            re = e
+                            rdx = dx
+                            rdy = dy
                         }
-                        if (hue < 0) hue += 360f
-                    }
-                    var sat = if (maxC == 0f) 0f else delta / maxC
-                    val v = maxC / 255f
-                    
-                    var modR = r
-                    var modG = g
-                    var modB = b
-                    
-                    var boostSat = false
-                    if (hue in 90f..160f) boostSat = true
-                    if ((hue >= 320f || hue <= 15f) && sat > 0.2f) boostSat = true
-                    if (hue in 180f..250f) boostSat = true
-                    
-                    if (boostSat) {
-                        sat = min(1f, sat * 1.15f)
-                        val c = v * sat
-                        val xVal = c * (1 - abs((hue / 60) % 2 - 1))
-                        val m = v - c
-                        var rF = 0f; var gF = 0f; var bF = 0f
-                        when (hue.toInt() / 60) {
-                            0 -> { rF = c; gF = xVal }
-                            1 -> { rF = xVal; gF = c }
-                            2 -> { gF = c; bF = xVal }
-                            3 -> { gF = xVal; bF = c }
-                            4 -> { rF = xVal; bF = c }
-                            5 -> { rF = c; bF = xVal }
-                        }
-                        modR = clamp(((rF + m) * 255).toInt())
-                        modG = clamp(((gF + m) * 255).toInt())
-                        modB = clamp(((bF + m) * 255).toInt())
-                    } else if (sat < 0.1f && v > 0.8f) {
-                        modR = clamp((r * 1.05f).toInt())
-                        modB = clamp((b * 0.95f).toInt())
-                    }
-                    finalPixels[idx] = (0xFF shl 24) or (modR shl 16) or (modG shl 8) or modB
-                }
-            }
-            
-            val outW = w * 2
-            val outH = h * 2
-            val outBitmap = Bitmap.createBitmap(outW, outH, Bitmap.Config.ARGB_8888)
-            val rowPixels = IntArray(outW)
-            
-            for (y in 0 until outH) {
-                val sy = y / 2
-                val yFrac = if (y % 2 == 1) 0.5f else 0f
-                for (x in 0 until outW) {
-                    val sx = x / 2
-                    val xFrac = if (x % 2 == 1) 0.5f else 0f
-                    
-                    if (xFrac == 0f && yFrac == 0f) {
-                        rowPixels[x] = finalPixels[sy * w + sx]
-                    } else if (xFrac == 0.5f && yFrac == 0f) {
-                        val p1 = finalPixels[sy * w + max(0, sx - 1)]
-                        val p2 = finalPixels[sy * w + sx]
-                        val p3 = finalPixels[sy * w + min(w - 1, sx + 1)]
-                        val p4 = finalPixels[sy * w + min(w - 1, sx + 2)]
-                        rowPixels[x] = bicubicExactHalf(p1, p2, p3, p4)
-                    } else if (xFrac == 0f && yFrac == 0.5f) {
-                        val p1 = finalPixels[max(0, sy - 1) * w + sx]
-                        val p2 = finalPixels[sy * w + sx]
-                        val p3 = finalPixels[min(h - 1, sy + 1) * w + sx]
-                        val p4 = finalPixels[min(h - 1, sy + 2) * w + sx]
-                        rowPixels[x] = bicubicExactHalf(p1, p2, p3, p4)
-                    } else {
-                        val c1 = bicubicExactHalf(finalPixels[max(0, sy - 1) * w + max(0, sx - 1)], finalPixels[max(0, sy - 1) * w + sx], finalPixels[max(0, sy - 1) * w + min(w - 1, sx + 1)], finalPixels[max(0, sy - 1) * w + min(w - 1, sx + 2)])
-                        val c2 = bicubicExactHalf(finalPixels[sy * w + max(0, sx - 1)], finalPixels[sy * w + sx], finalPixels[sy * w + min(w - 1, sx + 1)], finalPixels[sy * w + min(w - 1, sx + 2)])
-                        val c3 = bicubicExactHalf(finalPixels[min(h - 1, sy + 1) * w + max(0, sx - 1)], finalPixels[min(h - 1, sy + 1) * w + sx], finalPixels[min(h - 1, sy + 1) * w + min(w - 1, sx + 1)], finalPixels[min(h - 1, sy + 1) * w + min(w - 1, sx + 2)])
-                        val c4 = bicubicExactHalf(finalPixels[min(h - 1, sy + 2) * w + max(0, sx - 1)], finalPixels[min(h - 1, sy + 2) * w + sx], finalPixels[min(h - 1, sy + 2) * w + min(w - 1, sx + 1)], finalPixels[min(h - 1, sy + 2) * w + min(w - 1, sx + 2)])
-                        rowPixels[x] = bicubicExactHalf(c1, c2, c3, c4)
                     }
                 }
-                outBitmap.setPixels(rowPixels, 0, outW, 0, y, outW, 1)
+                log("align", "frame " + (k + 1) + " shift " + (rdx * 2) + "," + (rdy * 2) + " err " + re)
+                if (re <= ALIGN_MAX_ERR) {
+                    aligned.add(Shift(k, rdx * 2, rdy * 2))
+                } else {
+                    log("align", "frame " + (k + 1) + " skipped (too different)")
+                }
             }
-            
-            saveToGalleryAndFiles(context, outBitmap, timestamp)
-            outBitmap.recycle()
-            callback("Enhanced photo saved")
-        } catch (e: Exception) {
-            val fallback = BitmapFactory.decodeFile(files[0].absolutePath)
-            if (fallback != null) {
-                val scaled = Bitmap.createScaledBitmap(fallback, fallback.width * 2, fallback.height * 2, true)
-                saveToGalleryAndFiles(context, scaled, timestamp)
-                fallback.recycle()
-                scaled.recycle()
+
+            val bo = BitmapFactory.Options()
+            bo.inJustDecodeBounds = true
+            BitmapFactory.decodeFile(frames[best].absolutePath, bo)
+            val fullW = bo.outWidth
+            val fullH = bo.outHeight
+
+            val decs = HashMap<Int, BitmapRegionDecoder>()
+            val enhanced: Bitmap
+            try {
+                for (s in aligned) {
+                    decs[s.idx] = BitmapRegionDecoder.newInstance(frames[s.idx].absolutePath, false)
+                        ?: throw IllegalStateException("region decoder failed")
+                }
+                enhanced = upscale2x(
+                    sharpenAndColor(mergeBands(aligned, best, decs, fullW, fullH), fullW, fullH),
+                    fullW,
+                    fullH
+                )
+            } finally {
+                for (d in decs.values) d.recycle()
             }
-            callback("Enhanced photo saved")
+            log("merge", "merged " + aligned.size + " frames")
+
+            FileOutputStream(outFile).use { enhanced.compress(Bitmap.CompressFormat.JPEG, 95, it) }
+            enhanced.recycle()
+            return Result(outFile, false)
+        } catch (t: Throwable) {
+            log("pipeline", t)
+            try {
+                frames[fallbackIdx].copyTo(outFile, overwrite = true)
+            } catch (e: Throwable) {
+                log("fallback", e)
+            }
+            return Result(outFile, true)
         }
     }
 
-    private fun bicubicExactHalf(p1: Int, p2: Int, p3: Int, p4: Int): Int {
-        val r = clamp((9 * ((p2 shr 16 and 0xFF) + (p3 shr 16 and 0xFF)) - ((p1 shr 16 and 0xFF) + (p4 shr 16 and 0xFF))) / 16)
-        val g = clamp((9 * ((p2 shr 8 and 0xFF) + (p3 shr 8 and 0xFF)) - ((p1 shr 8 and 0xFF) + (p4 shr 8 and 0xFF))) / 16)
-        val b = clamp((9 * ((p2 and 0xFF) + (p3 and 0xFF)) - ((p1 and 0xFF) + (p4 and 0xFF))) / 16)
-        return (0xFF shl 24) or (r shl 16) or (g shl 8) or b
-    }
-
-    private fun getLaplacianVariance(bmp: Bitmap): Float {
+    private fun loadGray(file: File, sample: Int): Gray {
+        val opts = BitmapFactory.Options()
+        opts.inSampleSize = sample
+        opts.inPreferredConfig = Bitmap.Config.ARGB_8888
+        val bmp = BitmapFactory.decodeFile(file.absolutePath, opts)
+            ?: throw IllegalStateException("decode failed " + file.name)
         val w = bmp.width
         val h = bmp.height
         val px = IntArray(w * h)
         bmp.getPixels(px, 0, w, 0, 0, w, h)
-        var sum = 0L
-        var sumSq = 0L
-        var count = 0
-        for (y in 1 until h - 1) {
-            for (x in 1 until w - 1) {
-                val c = (px[y * w + x] and 0xFF) * 4
-                val l = px[y * w + x - 1] and 0xFF
-                val r = px[y * w + x + 1] and 0xFF
-                val t = px[(y - 1) * w + x] and 0xFF
-                val b = px[(y + 1) * w + x] and 0xFF
-                val lap = c - l - r - t - b
-                sum += lap
-                sumSq += lap * lap
-                count++
-            }
-        }
-        val mean = sum.toDouble() / count
-        return (sumSq.toDouble() / count - mean * mean).toFloat()
+        bmp.recycle()
+        val g = IntArray(w * h)
+        for (i in px.indices) g[i] = lum(px[i])
+        return Gray(w, h, g)
     }
 
-    private fun alignFrames(ref: Bitmap, src: Bitmap): Pair<Int, Int> {
-        val w = ref.width
-        val h = ref.height
-        val refPx = IntArray(w * h)
-        val srcPx = IntArray(w * h)
-        ref.getPixels(refPx, 0, w, 0, 0, w, h)
-        src.getPixels(srcPx, 0, w, 0, 0, w, h)
-        
-        var bestDx = 0
-        var bestDy = 0
-        var minDiff = Long.MAX_VALUE
-        val cx = w / 2; val cy = h / 2
-        val rad = 64
-        
-        for (dy in -8..8) {
-            for (dx in -8..8) {
-                var diff = 0L
-                for (y in cy - rad until cy + rad) {
-                    val sy = y + dy
-                    if (sy !in 0 until h) continue
-                    for (x in cx - rad until cx + rad) {
-                        val sx = x + dx
-                        if (sx !in 0 until w) continue
-                        val vRef = refPx[y * w + x] and 0xFF
-                        val vSrc = srcPx[sy * w + sx] and 0xFF
-                        diff += abs(vRef - vSrc)
+    private fun lum(c: Int): Int =
+        (((c shr 16) and 0xFF) * 77 + ((c shr 8) and 0xFF) * 150 + (c and 0xFF) * 29) shr 8
+
+    private fun sharpness(g: Gray): Double {
+        var sum = 0.0
+        var sum2 = 0.0
+        var n = 0
+        for (y in 1 until g.h - 1) {
+            for (x in 1 until g.w - 1) {
+                val i = y * g.w + x
+                val lap = 4 * g.v[i] - g.v[i - 1] - g.v[i + 1] - g.v[i - g.w] - g.v[i + g.w]
+                sum += lap.toDouble()
+                sum2 += lap.toDouble() * lap.toDouble()
+                n++
+            }
+        }
+        val mean = sum / n
+        return sum2 / n - mean * mean
+    }
+
+    private fun avgError(ref: Gray, cur: Gray, dx: Int, dy: Int, step: Int): Double {
+        val x0 = ref.w / 4
+        val x1 = ref.w * 3 / 4
+        val y0 = ref.h / 4
+        val y1 = ref.h * 3 / 4
+        var sum = 0L
+        var n = 0L
+        var y = y0
+        while (y < y1) {
+            var x = x0
+            while (x < x1) {
+                val cx = x + dx
+                val cy = y + dy
+                if (cx >= 0 && cx < cur.w && cy >= 0 && cy < cur.h) {
+                    sum += abs(ref.v[y * ref.w + x] - cur.v[cy * cur.w + cx]).toLong()
+                } else {
+                    sum += 255L
+                }
+                n++
+                x += step
+            }
+            y += step
+        }
+        return sum.toDouble() / n.toDouble()
+    }
+
+    private fun shiftedBand(
+        dec: BitmapRegionDecoder, dx: Int, dy: Int, y0: Int, rows: Int, w: Int, h: Int
+    ): IntArray {
+        val srcTop = (y0 + dy).coerceIn(0, h - rows)
+        val bmp = dec.decodeRegion(Rect(0, srcTop, w, srcTop + rows), null)
+            ?: throw IllegalStateException("region decode failed")
+        val src = IntArray(w * rows)
+        bmp.getPixels(src, 0, w, 0, 0, w, rows)
+        bmp.recycle()
+        val out = IntArray(w * rows)
+        for (ly in 0 until rows) {
+            val sy = (ly + y0 + dy - srcTop).coerceIn(0, rows - 1)
+            for (x in 0 until w) {
+                val sx = (x + dx).coerceIn(0, w - 1)
+                out[ly * w + x] = src[sy * w + sx]
+            }
+        }
+        return out
+    }
+
+    private fun mergeBands(
+        aligned: List<Shift>,
+        refIdx: Int,
+        decs: Map<Int, BitmapRegionDecoder>,
+        w: Int,
+        h: Int
+    ): ByteArray {
+        val out = ByteArray(w * h * 3)
+        var y0 = 0
+        while (y0 < h) {
+            val rows = min(BAND, h - y0)
+            val n = w * rows
+            val refBand = shiftedBand(decs.getValue(refIdx), 0, 0, y0, rows, w, h)
+            val sr = FloatArray(n)
+            val sg = FloatArray(n)
+            val sb = FloatArray(n)
+            val wt = FloatArray(n)
+            for (s in aligned) {
+                val isRef = s.idx == refIdx
+                val pix = if (isRef) refBand else shiftedBand(decs.getValue(s.idx), s.dx, s.dy, y0, rows, w, h)
+                for (i in 0 until n) {
+                    val c = pix[i]
+                    val ok = isRef || abs(lum(c) - lum(refBand[i])) <= GHOST_THRESH
+                    if (ok) {
+                        sr[i] += (c shr 16) and 0xFF
+                        sg[i] += (c shr 8) and 0xFF
+                        sb[i] += c and 0xFF
+                        wt[i] += 1f
                     }
                 }
-                if (diff < minDiff) { minDiff = diff; bestDx = dx; bestDy = dy }
             }
+            for (ly in 0 until rows) {
+                for (x in 0 until w) {
+                    val i = ly * w + x
+                    val o = ((y0 + ly) * w + x) * 3
+                    val inv = 1f / wt[i]
+                    out[o] = (sr[i] * inv + 0.5f).toInt().coerceIn(0, 255).toByte()
+                    out[o + 1] = (sg[i] * inv + 0.5f).toInt().coerceIn(0, 255).toByte()
+                    out[o + 2] = (sb[i] * inv + 0.5f).toInt().coerceIn(0, 255).toByte()
+                }
+            }
+            y0 += rows
         }
-        return Pair(bestDx, bestDy)
+        return out
     }
 
-    private fun clamp(v: Int): Int = max(0, min(255, v))
-
-    private fun saveToGalleryAndFiles(context: Context, bitmap: Bitmap, timestamp: String) {
-        val filename = "GC_${timestamp}_enhanced.jpg"
-        
-        val extDir = File(context.getExternalFilesDir(null), "enhanced").apply { mkdirs() }
-        val file = File(extDir, filename)
-        FileOutputStream(file).use { bitmap.compress(Bitmap.CompressFormat.JPEG, 95, it) }
-
-        val values = ContentValues().apply {
-            put(MediaStore.Images.Media.DISPLAY_NAME, filename)
-            put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
-            put(MediaStore.Images.Media.RELATIVE_PATH, Environment.DIRECTORY_PICTURES + "/GalaxyCamera")
-        }
-        val uri = context.contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
-        uri?.let {
-            context.contentResolver.openOutputStream(it)?.use { out ->
-                bitmap.compress(Bitmap.CompressFormat.JPEG, 95, out)
+    private fun sharpenAndColor(src: ByteArray, w: Int, h: Int): ByteArray {
+        val dst = src.copyOf()
+        for (y in 1 until h - 1) {
+            for (x in 1 until w - 1) {
+                val i = (y * w + x) * 3
+                val gC = (src[i + 1].toInt() and 0xFF).toFloat()
+                var sumG = 0
+                for (oy in -1..1) {
+                    for (ox in -1..1) {
+                        sumG += src[((y + oy) * w + (x + ox)) * 3 + 1].toInt() and 0xFF
+                    }
+                }
+                val edge = abs(gC - sumG / 9f)
+                val amount = if (edge > 12f) 0.9f else 0.35f
+                for (c in 0..2) {
+                    var s = 0
+                    for (oy in -1..1) {
+                        for (ox in -1..1) {
+                            s += src[((y + oy) * w + (x + ox)) * 3 + c].toInt() and 0xFF
+                        }
+                    }
+                    val v = (src[i + c].toInt() and 0xFF).toFloat()
+                    val avg = s / 9f
+                    dst[i + c] = (v + amount * (v - avg) + 0.5f).toInt().coerceIn(0, 255).toByte()
+                }
             }
+        }
+        boostChroma(dst)
+        return dst
+    }
+
+    private fun boostChroma(buf: ByteArray) {
+        var i = 0
+        while (i < buf.size) {
+            val r = (buf[i].toInt() and 0xFF) / 255f
+            val g = (buf[i + 1].toInt() and 0xFF) / 255f
+            val b = (buf[i + 2].toInt() and 0xFF) / 255f
+            val mx = max(r, max(g, b))
+            val mn = min(r, min(g, b))
+            val d = mx - mn
+            if (d > 0.06f && mx > 0.25f && inBoostHue(hueOf(r, g, b, mx, d))) {
+                val m = (r + g + b) / 3f
+                buf[i] = f2b(m + (r - m) * 1.15f)
+                buf[i + 1] = f2b(m + (g - m) * 1.15f)
+                buf[i + 2] = f2b(m + (b - m) * 1.15f)
+            }
+            i += 3
         }
     }
 
-    fun shutdown() {
-        executor.shutdown()
+    private fun hueOf(r: Float, g: Float, b: Float, mx: Float, d: Float): Float {
+        val h = when (mx) {
+            r -> 60f * (((g - b) / d) % 6f)
+            g -> 60f * ((b - r) / d + 2f)
+            else -> 60f * ((r - g) / d + 4f)
+        }
+        return if (h < 0f) h + 360f else h
+    }
+
+    private fun inBoostHue(h: Float): Boolean =
+        (h >= 90f && h <= 160f) || (h >= 180f && h <= 250f) || h >= 330f || h <= 8f
+
+    private fun f2b(v: Float): Byte {
+        val c = v.coerceIn(0f, 1f)
+        return (c * 255f + 0.5f).toInt().toByte()
+    }
+
+    private fun cubic(x: Float): Float {
+        val ax = abs(x)
+        return when {
+            ax <= 1f -> (1.5f * ax - 2.5f) * ax * ax + 1f
+            ax < 2f -> ((-0.5f * ax + 2.5f) * ax - 4f) * ax + 2f
+            else -> 0f
+        }
+    }
+
+    private fun upscale2x(src: ByteArray, w: Int, h: Int): Bitmap {
+        val ow = w * 2
+        val oh = h * 2
+        val xi = IntArray(ow * 4)
+        val xw = FloatArray(ow * 4)
+        for (ox in 0 until ow) {
+            val sx = (ox + 0.5f) / 2f - 0.5f
+            val ix = floor(sx).toInt()
+            val fx = sx - ix
+            for (k in 0..3) {
+                xi[ox * 4 + k] = (ix + k - 1).coerceIn(0, w - 1)
+                xw[ox * 4 + k] = cubic(fx - (k - 1))
+            }
+        }
+        val yi = IntArray(oh * 4)
+        val yw = FloatArray(oh * 4)
+        for (oy in 0 until oh) {
+            val sy = (oy + 0.5f) / 2f - 0.5f
+            val iy = floor(sy).toInt()
+            val fy = sy - iy
+            for (k in 0..3) {
+                yi[oy * 4 + k] = (iy + k - 1).coerceIn(0, h - 1)
+                yw[oy * 4 + k] = cubic(fy - (k - 1))
+            }
+        }
+
+        val bmp = Bitmap.createBitmap(ow, oh, Bitmap.Config.ARGB_8888)
+        val row = IntArray(ow)
+        for (oy in 0 until oh) {
+            for (ox in 0 until ow) {
+                var r = 0f
+                var g = 0f
+                var b = 0f
+                for (ky in 0..3) {
+                    val yy = yi[oy * 4 + ky]
+                    val wy = yw[oy * 4 + ky]
+                    for (kx in 0..3) {
+                        val xx = xi[ox * 4 + kx]
+                        val wgt = wy * xw[ox * 4 + kx]
+                        val p = (yy * w + xx) * 3
+                        r += (src[p].toInt() and 0xFF) * wgt
+                        g += (src[p + 1].toInt() and 0xFF) * wgt
+                        b += (src[p + 2].toInt() and 0xFF) * wgt
+                    }
+                }
+                val rr = (r + 0.5f).toInt().coerceIn(0, 255)
+                val gg = (g + 0.5f).toInt().coerceIn(0, 255)
+                val bb = (b + 0.5f).toInt().coerceIn(0, 255)
+                row[ox] = (0xFF shl 24) or (rr shl 16) or (gg shl 8) or bb
+            }
+            bmp.setPixels(row, 0, ow, 0, oy, ow, 1)
+        }
+        return bmp
     }
 }
