@@ -3,7 +3,9 @@ package com.example.galaxycamera
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.BitmapRegionDecoder
+import android.graphics.ImageFormat
 import android.graphics.Rect
+import android.graphics.YuvImage
 import java.io.File
 import java.io.FileOutputStream
 import kotlin.math.abs
@@ -88,24 +90,19 @@ class ImageProcessor(private val log: (String, String, Throwable?) -> Unit) {
             val fullH = bo.outHeight
 
             val decs = HashMap<Int, BitmapRegionDecoder>()
-            val enhanced: Bitmap
             try {
                 for (s in aligned) {
                     decs[s.idx] = BitmapRegionDecoder.newInstance(frames[s.idx].absolutePath, false)
                         ?: throw IllegalStateException("region decoder failed")
                 }
-                enhanced = toBitmap(
-                    sharpenAndColor(mergeBands(aligned, best, decs, fullW, fullH), fullW, fullH),
-                    fullW,
-                    fullH
-                )
+                log("merge", "start merging " + aligned.size + " frames", null)
+                val nv21 = rgbToSharpNv21(mergeBands(aligned, best, decs, fullW, fullH), fullW, fullH)
+                val yuv = YuvImage(nv21, ImageFormat.NV21, fullW, fullH, null)
+                FileOutputStream(outFile).use { yuv.compressToJpeg(Rect(0, 0, fullW, fullH), 95, it) }
             } finally {
                 for (d in decs.values) d.recycle()
             }
             log("merge", "merged " + aligned.size + " frames", null)
-
-            FileOutputStream(outFile).use { enhanced.compress(Bitmap.CompressFormat.JPEG, 95, it) }
-            enhanced.recycle()
             return Result(outFile, false)
         } catch (t: Throwable) {
             log("pipeline", "failed, saving sharpest frame", t)
@@ -202,6 +199,7 @@ class ImageProcessor(private val log: (String, String, Throwable?) -> Unit) {
         return out
     }
 
+    // Merges aligned frames band by band into an RGB buffer (w*h*3 bytes).
     private fun mergeBands(
         aligned: List<Shift>,
         refIdx: Int,
@@ -248,54 +246,83 @@ class ImageProcessor(private val log: (String, String, Throwable?) -> Unit) {
         return out
     }
 
-    private fun sharpenAndColor(src: ByteArray, w: Int, h: Int): ByteArray {
-        val dst = src.copyOf()
-        for (y in 1 until h - 1) {
-            for (x in 1 until w - 1) {
+    // Sharpens text and edges, boosts the chosen colours, and converts
+    // directly to NV21 (YUV420) for JPEG output. Only one extra buffer is made.
+    private fun rgbToSharpNv21(src: ByteArray, w: Int, h: Int): ByteArray {
+        val out = ByteArray(w * h * 3 / 2)
+        val uvBase = w * h
+        for (y in 0 until h) {
+            val ya = if (y > 0) y - 1 else 0
+            val yb = if (y < h - 1) y + 1 else h - 1
+            for (x in 0 until w) {
+                val xa = if (x > 0) x - 1 else 0
+                val xb = if (x < w - 1) x + 1 else w - 1
+                val count = (yb - ya + 1) * (xb - xa + 1)
                 val i = (y * w + x) * 3
+
                 val gC = (src[i + 1].toInt() and 0xFF).toFloat()
                 var sumG = 0
-                for (oy in -1..1) {
-                    for (ox in -1..1) {
-                        sumG += src[((y + oy) * w + (x + ox)) * 3 + 1].toInt() and 0xFF
+                for (oy in ya..yb) {
+                    for (ox in xa..xb) {
+                        sumG += src[(oy * w + ox) * 3 + 1].toInt() and 0xFF
                     }
                 }
-                val edge = abs(gC - sumG / 9f)
+                val edge = abs(gC - sumG.toFloat() / count)
                 val amount = if (edge > 12f) 0.9f else 0.35f
-                for (c in 0..2) {
-                    var s = 0
-                    for (oy in -1..1) {
-                        for (ox in -1..1) {
-                            s += src[((y + oy) * w + (x + ox)) * 3 + c].toInt() and 0xFF
-                        }
-                    }
-                    val v = (src[i + c].toInt() and 0xFF).toFloat()
-                    val avg = s / 9f
-                    dst[i + c] = (v + amount * (v - avg) + 0.5f).toInt().coerceIn(0, 255).toByte()
+
+                var r = sharpChannel(src, w, ya, yb, xa, xb, count, i, 0, amount) / 255f
+                var g = sharpChannel(src, w, ya, yb, xa, xb, count, i, 1, amount) / 255f
+                var b = sharpChannel(src, w, ya, yb, xa, xb, count, i, 2, amount) / 255f
+
+                val mx = max(r, max(g, b))
+                val mn = min(r, min(g, b))
+                val d = mx - mn
+                if (d > 0.06f && mx > 0.25f && inBoostHue(hueOf(r, g, b, mx, d))) {
+                    val m = (r + g + b) / 3f
+                    r = (m + (r - m) * 1.15f).coerceIn(0f, 1f)
+                    g = (m + (g - m) * 1.15f).coerceIn(0f, 1f)
+                    b = (m + (b - m) * 1.15f).coerceIn(0f, 1f)
+                }
+
+                val rr = r * 255f
+                val gg = g * 255f
+                val bb = b * 255f
+                val yv = 0.299f * rr + 0.587f * gg + 0.114f * bb
+                out[y * w + x] = (yv + 0.5f).toInt().coerceIn(0, 255).toByte()
+
+                if ((y and 1) == 0 && (x and 1) == 0) {
+                    val u = -0.169f * rr - 0.331f * gg + 0.5f * bb + 128f
+                    val v = 0.5f * rr - 0.419f * gg - 0.081f * bb + 128f
+                    val idx = uvBase + (y / 2) * w + x
+                    out[idx] = (v + 0.5f).toInt().coerceIn(0, 255).toByte()
+                    out[idx + 1] = (u + 0.5f).toInt().coerceIn(0, 255).toByte()
                 }
             }
         }
-        boostChroma(dst)
-        return dst
+        return out
     }
 
-    private fun boostChroma(buf: ByteArray) {
-        var i = 0
-        while (i < buf.size) {
-            val r = (buf[i].toInt() and 0xFF) / 255f
-            val g = (buf[i + 1].toInt() and 0xFF) / 255f
-            val b = (buf[i + 2].toInt() and 0xFF) / 255f
-            val mx = max(r, max(g, b))
-            val mn = min(r, min(g, b))
-            val d = mx - mn
-            if (d > 0.06f && mx > 0.25f && inBoostHue(hueOf(r, g, b, mx, d))) {
-                val m = (r + g + b) / 3f
-                buf[i] = f2b(m + (r - m) * 1.15f)
-                buf[i + 1] = f2b(m + (g - m) * 1.15f)
-                buf[i + 2] = f2b(m + (b - m) * 1.15f)
+    private fun sharpChannel(
+        src: ByteArray,
+        w: Int,
+        ya: Int,
+        yb: Int,
+        xa: Int,
+        xb: Int,
+        count: Int,
+        i: Int,
+        c: Int,
+        amount: Float
+    ): Float {
+        var s = 0
+        for (oy in ya..yb) {
+            for (ox in xa..xb) {
+                s += src[(oy * w + ox) * 3 + c].toInt() and 0xFF
             }
-            i += 3
         }
+        val v = (src[i + c].toInt() and 0xFF).toFloat()
+        val avg = s.toFloat() / count
+        return (v + amount * (v - avg)).coerceIn(0f, 255f)
     }
 
     private fun hueOf(r: Float, g: Float, b: Float, mx: Float, d: Float): Float {
@@ -309,25 +336,4 @@ class ImageProcessor(private val log: (String, String, Throwable?) -> Unit) {
 
     private fun inBoostHue(h: Float): Boolean =
         (h >= 90f && h <= 160f) || (h >= 180f && h <= 250f) || h >= 330f || h <= 8f
-
-    private fun f2b(v: Float): Byte {
-        val c = v.coerceIn(0f, 1f)
-        return (c * 255f + 0.5f).toInt().toByte()
-    }
-
-    private fun toBitmap(src: ByteArray, w: Int, h: Int): Bitmap {
-        val bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
-        val row = IntArray(w)
-        for (y in 0 until h) {
-            for (x in 0 until w) {
-                val p = (y * w + x) * 3
-                val r = src[p].toInt() and 0xFF
-                val g = src[p + 1].toInt() and 0xFF
-                val b = src[p + 2].toInt() and 0xFF
-                row[x] = (0xFF shl 24) or (r shl 16) or (g shl 8) or b
-            }
-            bmp.setPixels(row, 0, w, 0, y, w, 1)
-        }
-        return bmp
-    }
 }
