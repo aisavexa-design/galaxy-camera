@@ -268,7 +268,7 @@ class ImageProcessor(private val log: (String, String, Throwable?) -> Unit) {
                     }
                 }
                 val edge = abs(gC - sumG.toFloat() / count)
-                val amount = if (edge > 12f) 0.9f else 0.35f
+                val amount = if (edge > 6f) 1.4f else 0.6f
 
                 var r = sharpChannel(src, w, ya, yb, xa, xb, count, i, 0, amount) / 255f
                 var g = sharpChannel(src, w, ya, yb, xa, xb, count, i, 1, amount) / 255f
@@ -277,11 +277,11 @@ class ImageProcessor(private val log: (String, String, Throwable?) -> Unit) {
                 val mx = max(r, max(g, b))
                 val mn = min(r, min(g, b))
                 val d = mx - mn
-                if (d > 0.06f && mx > 0.25f && inBoostHue(hueOf(r, g, b, mx, d))) {
+                if (d > 0.04f && mx > 0.2f && inBoostHue(hueOf(r, g, b, mx, d))) {
                     val m = (r + g + b) / 3f
-                    r = (m + (r - m) * 1.15f).coerceIn(0f, 1f)
-                    g = (m + (g - m) * 1.15f).coerceIn(0f, 1f)
-                    b = (m + (b - m) * 1.15f).coerceIn(0f, 1f)
+                    r = (m + (r - m) * 1.30f).coerceIn(0f, 1f)
+                    g = (m + (g - m) * 1.30f).coerceIn(0f, 1f)
+                    b = (m + (b - m) * 1.30f).coerceIn(0f, 1f)
                 }
 
                 val rr = r * 255f
