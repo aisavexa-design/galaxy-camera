@@ -29,6 +29,7 @@ import android.hardware.camera2.CaptureRequest
 import android.media.ExifInterface
 import android.media.Image
 import android.media.ImageReader
+import android.media.MediaRecorder
 import android.os.Bundle
 import android.os.Handler
 import android.os.HandlerThread
@@ -45,6 +46,7 @@ import android.view.TextureView
 import android.view.View
 import android.view.WindowInsets
 import android.view.WindowManager
+import android.view.animation.DecelerateInterpolator
 import android.view.animation.OvershootInterpolator
 import android.widget.Button
 import android.widget.FrameLayout
@@ -67,13 +69,22 @@ class MainActivity : Activity() {
     private lateinit var textureView: TextureView
     private lateinit var toastText: TextView
     private lateinit var countdownText: TextView
+    private lateinit var shutterView: ShutterView
     private lateinit var iconFlash: IconView
     private lateinit var iconTimer: IconView
     private lateinit var iconRatio: IconView
     private lateinit var iconRes: IconView
     private lateinit var moonView: IconView
+    private lateinit var zoomPill: LinearLayout
+    private lateinit var dotsBar: LinearLayout
+    private lateinit var dotFlash: IconView
+    private lateinit var dotTimer: IconView
+    private lateinit var dotRatio: IconView
+    private lateinit var dotRes: IconView
     private val zoomViews = ArrayList<TextView>()
     private val modeViews = ArrayList<TextView>()
+    private var moreOverlay: FrameLayout? = null
+    private var dotsVisible = false
     private var debugText: TextView? = null
     private var uiReady = false
     private var screenWpx = 1080
@@ -89,6 +100,13 @@ class MainActivity : Activity() {
     private var useUltra = false       // true = 0.5x ultrawide
     private var isFront = false
     private var activeMode = "PHOTO"
+    private var video4k = false        // false = 1080p 60fps, true = 4K 30fps
+
+    // Recording state
+    private var isRecording = false
+    private var recorder: MediaRecorder? = null
+    private var recordFile: File? = null
+    private var recordFps = 60
 
     // Camera state
     private var rearId: String? = null
@@ -172,6 +190,7 @@ class MainActivity : Activity() {
 
     override fun onPause() {
         if (uiReady) {
+            if (isRecording) stopRecording(false)
             closeCamera()
             stopBackgroundThread()
         }
@@ -192,7 +211,7 @@ class MainActivity : Activity() {
         }
     }
 
-    // Volume keys take the photo, just like the shutter button.
+    // Volume keys take the photo (or start/stop video), just like the shutter.
     override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {
         if (keyCode == KeyEvent.KEYCODE_VOLUME_UP || keyCode == KeyEvent.KEYCODE_VOLUME_DOWN) {
             if (event?.repeatCount == 0 && uiReady) {
@@ -221,6 +240,7 @@ class MainActivity : Activity() {
         useUltra = p.getBoolean("ultra", false)
         isFront = p.getBoolean("front", false)
         activeMode = p.getString("mode", "PHOTO") ?: "PHOTO"
+        video4k = p.getBoolean("video4k", false)
     }
 
     private fun savePrefs() {
@@ -234,6 +254,7 @@ class MainActivity : Activity() {
             .putBoolean("ultra", useUltra)
             .putBoolean("front", isFront)
             .putString("mode", activeMode)
+            .putBoolean("video4k", video4k)
             .apply()
     }
 
@@ -443,9 +464,9 @@ class MainActivity : Activity() {
         iconTimer.setOnClickListener { cycleTimer() }
         iconRatio.setOnClickListener { toggleRatio() }
         iconRes.setOnClickListener { toggleResolution() }
-        iconMotion.setOnClickListener { showToast("Coming in next step") }
-        iconEffects.setOnClickListener { showToast("Coming in next step") }
-        iconFace.setOnClickListener { showToast("Coming in next step") }
+        iconMotion.setOnClickListener { showToast("Motion photo is in the next step") }
+        iconEffects.setOnClickListener { showToast("Effects is in the next step") }
+        iconFace.setOnClickListener { showToast("Face is in the next step") }
 
         // Night (moon) button at the right of the preview
         moonView = IconView(this, "moon")
@@ -458,7 +479,7 @@ class MainActivity : Activity() {
         rootView.addView(moonView, moonParams)
 
         // Zoom pill: .5 | 1x | 2
-        val zoomPill = buildZoomPill()
+        zoomPill = buildZoomPill()
         val zoomParams = FrameLayout.LayoutParams(
             FrameLayout.LayoutParams.WRAP_CONTENT,
             FrameLayout.LayoutParams.WRAP_CONTENT
@@ -468,6 +489,17 @@ class MainActivity : Activity() {
         }
         rootView.addView(zoomPill, zoomParams)
 
+        // 4-dots bar (replaces the zoom pill when open)
+        dotsBar = buildDotsBar()
+        val dotsBarParams = FrameLayout.LayoutParams(
+            FrameLayout.LayoutParams.WRAP_CONTENT,
+            FrameLayout.LayoutParams.WRAP_CONTENT
+        ).apply {
+            gravity = Gravity.CENTER_HORIZONTAL
+            topMargin = (screenHpx * 0.704f).toInt()
+        }
+        rootView.addView(dotsBar, dotsBarParams)
+
         // 4-dots button
         val dotsView = IconView(this, "dots")
         dotsView.background = oval(Color.parseColor("#66333333"))
@@ -475,12 +507,12 @@ class MainActivity : Activity() {
         val dotsParams = FrameLayout.LayoutParams(dotsSize, dotsSize)
         dotsParams.leftMargin = (screenWpx * 0.9f - dotsSize / 2f).toInt()
         dotsParams.topMargin = (screenHpx * 0.734f - dotsSize / 2f).toInt()
-        dotsView.setOnClickListener { showToast("Coming in next step") }
+        dotsView.setOnClickListener { toggleDotsBar() }
         rootView.addView(dotsView, dotsParams)
 
-        // Gallery (left), shutter (centre), flip (right)
+        // Shutter (centre)
         val shutterSize = (screenWpx * 0.178f).toInt()
-        val shutterView = CircleView(this, Color.parseColor("#FAFAF7"))
+        shutterView = ShutterView(this)
         val shutterParams = FrameLayout.LayoutParams(shutterSize, shutterSize)
         shutterParams.leftMargin = (screenWpx * 0.5f - shutterSize / 2f).toInt()
         shutterParams.topMargin = (screenHpx * 0.829f - shutterSize / 2f).toInt()
@@ -500,6 +532,7 @@ class MainActivity : Activity() {
         }
         rootView.addView(shutterView, shutterParams)
 
+        // Gallery (left)
         val gallerySize = (screenWpx * 0.13f).toInt()
         val galleryView = CircleView(this, Color.DKGRAY)
         val galleryParams = FrameLayout.LayoutParams(gallerySize, gallerySize)
@@ -508,6 +541,7 @@ class MainActivity : Activity() {
         galleryView.setOnClickListener { openGallery() }
         rootView.addView(galleryView, galleryParams)
 
+        // Flip (right)
         val flipSize = (screenWpx * 0.133f).toInt()
         val flipView = CircleView(this, Color.parseColor("#2B2B2B"))
         val flipParams = FrameLayout.LayoutParams(flipSize, flipSize)
@@ -561,6 +595,12 @@ class MainActivity : Activity() {
             setColor(color)
         }
 
+    private fun topRounded(color: Int, radius: Float): GradientDrawable =
+        GradientDrawable().apply {
+            setColor(color)
+            cornerRadii = floatArrayOf(radius, radius, radius, radius, 0f, 0f, 0f, 0f)
+        }
+
     private fun buildZoomPill(): LinearLayout {
         val pill = LinearLayout(this)
         pill.orientation = LinearLayout.HORIZONTAL
@@ -585,6 +625,37 @@ class MainActivity : Activity() {
         return pill
     }
 
+    private fun buildDotsBar(): LinearLayout {
+        val bar = LinearLayout(this)
+        bar.orientation = LinearLayout.HORIZONTAL
+        bar.gravity = Gravity.CENTER
+        bar.background = roundRect(Color.parseColor("#CC333333"), 400f)
+        val cell = (screenWpx * 0.1f).toInt()
+
+        val gear = IconView(this, "gear")
+        dotFlash = IconView(this, "flash")
+        dotTimer = IconView(this, "timer")
+        dotRatio = IconView(this, "ratio")
+        dotRes = IconView(this, "res")
+        val motion = IconView(this, "motion")
+        val effects = IconView(this, "effects")
+        val close = IconView(this, "close")
+        val views = listOf(gear, dotFlash, dotTimer, dotRatio, dotRes, motion, effects, close)
+        for (v in views) {
+            bar.addView(v, LinearLayout.LayoutParams(cell, cell))
+        }
+        gear.setOnClickListener { showToast("Settings is in the next step") }
+        dotFlash.setOnClickListener { cycleFlash() }
+        dotTimer.setOnClickListener { cycleTimer() }
+        dotRatio.setOnClickListener { toggleRatio() }
+        dotRes.setOnClickListener { toggleResolution() }
+        motion.setOnClickListener { showToast("Motion photo is in the next step") }
+        effects.setOnClickListener { showToast("Effects is in the next step") }
+        close.setOnClickListener { hideDotsBar() }
+        bar.visibility = View.GONE
+        return bar
+    }
+
     private fun buildModeStrip(): LinearLayout {
         val strip = LinearLayout(this)
         strip.orientation = LinearLayout.HORIZONTAL
@@ -604,21 +675,41 @@ class MainActivity : Activity() {
 
     private fun updateAllIcons() {
         if (!uiReady) return
-        iconFlash.state = flashMode
-        iconFlash.invalidate()
-        iconTimer.label = if (timerSec == 0) "" else timerSec.toString()
-        iconTimer.invalidate()
-        iconRatio.label = if (squareMode) "1:1" else "3:4"
-        iconRatio.invalidate()
-        iconRes.label = if (highRes) "12M" else "3M"
-        iconRes.invalidate()
+        val timerLabel = if (timerSec == 0) "" else timerSec.toString()
+        val ratioLabel = if (squareMode) "1:1" else "3:4"
+        val resLabel = if (activeMode == "VIDEO") {
+            if (video4k) "4K30" else "FHD60"
+        } else {
+            if (highRes) "12M" else "3M"
+        }
+        for (v in listOf(iconFlash, dotFlash)) {
+            v.state = flashMode
+            v.invalidate()
+        }
+        for (v in listOf(iconTimer, dotTimer)) {
+            v.label = timerLabel
+            v.invalidate()
+        }
+        for (v in listOf(iconRatio, dotRatio)) {
+            v.label = ratioLabel
+            v.invalidate()
+        }
+        for (v in listOf(iconRes, dotRes)) {
+            v.label = resLabel
+            v.invalidate()
+        }
         moonView.state = if (nightOn) 1 else 0
         moonView.invalidate()
         updateZoomPill()
         updateModeStrip()
+        updateShutter()
     }
 
     private fun updateZoomPill() {
+        val video = activeMode == "VIDEO"
+        if (zoomViews.isNotEmpty()) {
+            zoomViews[0].visibility = if (video) View.GONE else View.VISIBLE
+        }
         val sel = if (useUltra) 0 else if (zoomLevel > 1.5f) 2 else 1
         for (i in zoomViews.indices) {
             val tv = zoomViews[i]
@@ -636,14 +727,39 @@ class MainActivity : Activity() {
         }
     }
 
+    private fun updateShutter() {
+        if (!::shutterView.isInitialized) return
+        shutterView.videoMode = activeMode == "VIDEO"
+        shutterView.recording = isRecording
+        shutterView.invalidate()
+    }
+
     private fun onModeClicked(label: String) {
-        if (label == "PHOTO") {
-            activeMode = label
-            savePrefs()
-        } else {
-            showToast("Coming in next step")
+        when (label) {
+            "PHOTO", "VIDEO" -> {
+                if (isRecording) {
+                    showToast("Stop recording first")
+                    return
+                }
+                activeMode = label
+                if (label == "VIDEO" && useUltra) {
+                    useUltra = false
+                    zoomLevel = 1f
+                    savePrefs()
+                    restartCamera()
+                }
+                savePrefs()
+            }
+            "MORE" -> {
+                showMorePopup()
+                return
+            }
+            else -> {
+                showToast("Coming in next step")
+                return
+            }
         }
-        updateModeStrip()
+        updateAllIcons()
     }
 
     private fun showToast(message: String) {
@@ -660,8 +776,16 @@ class MainActivity : Activity() {
     }
 
     // ------------------------------------------------------------------
-    // Icon actions (all working)
+    // Icon actions
     // ------------------------------------------------------------------
+
+    private fun blockedWhileRecording(): Boolean {
+        if (isRecording) {
+            showToast("Stop recording first")
+            return true
+        }
+        return false
+    }
 
     private fun cycleFlash() {
         flashMode = (flashMode + 1) % 3
@@ -681,6 +805,7 @@ class MainActivity : Activity() {
     }
 
     private fun toggleRatio() {
+        if (blockedWhileRecording()) return
         squareMode = !squareMode
         savePrefs()
         updatePreviewLayout()
@@ -689,6 +814,14 @@ class MainActivity : Activity() {
     }
 
     private fun toggleResolution() {
+        if (activeMode == "VIDEO") {
+            video4k = !video4k
+            savePrefs()
+            updateAllIcons()
+            showToast(if (video4k) "Video: 4K 30fps" else "Video: 1080p 60fps")
+            return
+        }
+        if (blockedWhileRecording()) return
         highRes = !highRes
         savePrefs()
         updateAllIcons()
@@ -704,6 +837,7 @@ class MainActivity : Activity() {
     }
 
     private fun setZoom(z: Float) {
+        if (blockedWhileRecording()) return
         pickCameraIds()
         if (z < 1f) {
             if (isFront || ultraId == null) {
@@ -733,6 +867,7 @@ class MainActivity : Activity() {
 
     private fun switchCamera() {
         if (!uiReady) return
+        if (blockedWhileRecording()) return
         pickCameraIds()
         if (frontId == null) {
             showToast("Front camera not found")
@@ -757,16 +892,173 @@ class MainActivity : Activity() {
     }
 
     // ------------------------------------------------------------------
-    // Shutter with timer
+    // 4-dots bar
+    // ------------------------------------------------------------------
+
+    private fun toggleDotsBar() {
+        if (dotsVisible) hideDotsBar() else showDotsBar()
+    }
+
+    private fun showDotsBar() {
+        if (blockedWhileRecording()) return
+        dotsVisible = true
+        zoomPill.visibility = View.GONE
+        dotsBar.visibility = View.VISIBLE
+        dotsBar.alpha = 0f
+        dotsBar.scaleX = 0.9f
+        dotsBar.scaleY = 0.9f
+        dotsBar.animate().alpha(1f).scaleX(1f).scaleY(1f).setDuration(200).start()
+    }
+
+    private fun hideDotsBar() {
+        dotsVisible = false
+        dotsBar.animate().alpha(0f).setDuration(150).withEndAction {
+            dotsBar.visibility = View.GONE
+        }.start()
+        zoomPill.visibility = View.VISIBLE
+        zoomPill.alpha = 0f
+        zoomPill.animate().alpha(1f).setDuration(200).start()
+    }
+
+    // ------------------------------------------------------------------
+    // MORE popup
+    // ------------------------------------------------------------------
+
+    private fun showMorePopup() {
+        if (moreOverlay != null) return
+        if (blockedWhileRecording()) return
+
+        val overlay = FrameLayout(this)
+        overlay.setBackgroundColor(Color.parseColor("#AA000000"))
+        overlay.setOnClickListener { hideMorePopup() }
+
+        val card = LinearLayout(this)
+        card.orientation = LinearLayout.VERTICAL
+        card.background = topRounded(Color.parseColor("#F01C1C1E"), 56f)
+        card.setPadding(24, 48, 24, 56)
+        card.isClickable = true
+
+        val items = listOf(
+            "PRO", "PRO VIDEO", "NIGHT", "FOOD",
+            "PANORAMA", "MACRO", "SUPER SLOW-MO", "SLOW MOTION",
+            "HYPERLAPSE"
+        )
+        val itemViews = ArrayList<View>()
+        for (chunk in items.chunked(4)) {
+            val row = LinearLayout(this)
+            row.orientation = LinearLayout.HORIZONTAL
+            for (label in chunk) {
+                val item = buildMoreItem(label)
+                row.addView(item, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+                itemViews.add(item)
+            }
+            card.addView(
+                row,
+                LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT,
+                    LinearLayout.LayoutParams.WRAP_CONTENT
+                )
+            )
+        }
+
+        overlay.addView(
+            card,
+            FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.WRAP_CONTENT,
+                Gravity.BOTTOM
+            )
+        )
+        rootView.addView(
+            overlay,
+            FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.MATCH_PARENT
+            )
+        )
+        moreOverlay = overlay
+
+        // Animations: dim fades in, card slides up, items pop one by one.
+        overlay.alpha = 0f
+        overlay.animate().alpha(1f).setDuration(200).start()
+        card.translationY = screenHpx * 0.5f
+        card.animate().translationY(0f).setDuration(280)
+            .setInterpolator(DecelerateInterpolator()).start()
+        for (i in itemViews.indices) {
+            val v = itemViews[i]
+            v.alpha = 0f
+            v.scaleX = 0.7f
+            v.scaleY = 0.7f
+            v.animate().alpha(1f).scaleX(1f).scaleY(1f)
+                .setStartDelay(120L + i * 40L)
+                .setDuration(220)
+                .setInterpolator(OvershootInterpolator(1.2f))
+                .start()
+        }
+    }
+
+    private fun hideMorePopup() {
+        val overlay = moreOverlay ?: return
+        moreOverlay = null
+        val card = overlay.getChildAt(0)
+        card?.animate()?.translationY(screenHpx * 0.5f)?.setDuration(220)?.start()
+        overlay.animate().alpha(0f).setDuration(220).withEndAction {
+            rootView.removeView(overlay)
+        }.start()
+    }
+
+    private fun buildMoreItem(label: String): LinearLayout {
+        val item = LinearLayout(this)
+        item.orientation = LinearLayout.VERTICAL
+        item.gravity = Gravity.CENTER_HORIZONTAL
+        item.setPadding(4, 12, 4, 12)
+        val size = (screenWpx * 0.14f).toInt()
+        val icon = IconView(this, "more")
+        item.addView(icon, LinearLayout.LayoutParams(size, size))
+        val tv = TextView(this)
+        tv.text = label
+        tv.setTextColor(Color.WHITE)
+        tv.textSize = 10f
+        tv.gravity = Gravity.CENTER
+        tv.setPadding(0, 8, 0, 0)
+        item.addView(
+            tv,
+            LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            )
+        )
+        item.setOnClickListener { onMoreItem(label) }
+        return item
+    }
+
+    private fun onMoreItem(label: String) {
+        hideMorePopup()
+        when (label) {
+            "NIGHT" -> toggleNight()
+            else -> showToast(label + " is in the next step")
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Shutter: photo, video, timer
     // ------------------------------------------------------------------
 
     private fun onShutter() {
         if (!uiReady) return
         if (timerRunning.get()) return
         if (timerSec == 0) {
-            captureBurst()
+            performShutter()
         } else {
             startCountdown(timerSec)
+        }
+    }
+
+    private fun performShutter() {
+        if (activeMode == "VIDEO") {
+            if (isRecording) stopRecording(true) else startRecording()
+        } else {
+            captureBurst()
         }
     }
 
@@ -778,7 +1070,7 @@ class MainActivity : Activity() {
                 if (left <= 0) {
                     countdownText.visibility = View.GONE
                     timerRunning.set(false)
-                    captureBurst()
+                    performShutter()
                 } else {
                     countdownText.text = left.toString()
                     countdownText.visibility = View.VISIBLE
@@ -788,6 +1080,135 @@ class MainActivity : Activity() {
             }
         }
         uiHandler.post(tick)
+    }
+
+    // ------------------------------------------------------------------
+    // Video recording
+    // ------------------------------------------------------------------
+
+    private class VideoCfg(val w: Int, val h: Int, val fps: Int)
+
+    // Picks 1080p 60fps or 4K 30fps, with a clear fallback if the phone lacks it.
+    private fun pickVideoConfig(chars: CameraCharacteristics): VideoCfg {
+        val wantW = if (video4k) 3840 else 1920
+        val wantH = if (video4k) 2160 else 1080
+        val wantFps = if (video4k) 30 else 60
+        val map = chars.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+        val sizes: Array<Size> = map?.getOutputSizes(MediaRecorder::class.java) ?: arrayOf()
+        val ranges: Array<Range<Int>> =
+            chars.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES) ?: arrayOf()
+
+        var w = wantW
+        var h = wantH
+        if (sizes.none { it.width == wantW && it.height == wantH }) {
+            w = 1920
+            h = 1080
+            showToast("4K not supported here, using 1080p")
+        }
+        var fps = wantFps
+        if (ranges.none { it.lower <= wantFps && it.upper >= wantFps }) {
+            fps = 30
+            showToast("60fps not supported here, using 30fps")
+        }
+        return VideoCfg(w, h, fps)
+    }
+
+    private fun startRecording() {
+        if (isRecording) return
+        val chars = currentChars
+        if (cameraDevice == null || chars == null) {
+            showToast("Camera not ready")
+            return
+        }
+        val cfg = pickVideoConfig(chars)
+        val dir = File(getExternalFilesDir(null) ?: filesDir, "video")
+        dir.mkdirs()
+        val file = File(dir, "VID_" + System.currentTimeMillis() + ".mp4")
+        try {
+            val rec = MediaRecorder(this)
+            rec.setVideoSource(MediaRecorder.VideoSource.SURFACE)
+            rec.setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
+            rec.setOutputFile(file.absolutePath)
+            rec.setVideoEncoder(MediaRecorder.VideoEncoder.H264)
+            rec.setVideoSize(cfg.w, cfg.h)
+            rec.setVideoFrameRate(cfg.fps)
+            rec.setVideoEncodingBitRate(if (cfg.w >= 3840) 50_000_000 else 25_000_000)
+            rec.setOrientationHint(sensorOrientation)
+            rec.prepare()
+            recorder = rec
+            recordFile = file
+            recordFps = cfg.fps
+            isRecording = true
+            updateShutter()
+            createCameraPreviewSession()
+        } catch (e: Throwable) {
+            logError("startRecording", e)
+            recorder = null
+            recordFile = null
+            isRecording = false
+            updateShutter()
+            showToast("Could not start video")
+        }
+    }
+
+    // stopPreview = true restarts the normal photo preview afterwards.
+    private fun stopRecording(restartPreview: Boolean) {
+        if (!isRecording) return
+        isRecording = false
+        try {
+            captureSession?.close()
+        } catch (e: Throwable) {
+        }
+        captureSession = null
+        val f = finalizeRecorder()
+        updateShutter()
+        if (restartPreview) createCameraPreviewSession()
+        if (f != null && f.exists()) saveVideoToGallery(f)
+    }
+
+    private fun finalizeRecorder(): File? {
+        val rec = recorder
+        recorder = null
+        try {
+            rec?.stop()
+        } catch (e: Throwable) {
+            logError("recorderStop", e)
+        }
+        try {
+            rec?.release()
+        } catch (e: Throwable) {
+        }
+        val f = recordFile
+        recordFile = null
+        return f
+    }
+
+    private fun saveVideoToGallery(f: File) {
+        val executor = backgroundExecutor ?: return
+        try {
+            executor.execute {
+                try {
+                    val values = ContentValues().apply {
+                        put(MediaStore.Video.Media.DISPLAY_NAME, f.name)
+                        put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
+                        put(MediaStore.Video.Media.RELATIVE_PATH, "Movies/GalaxyCamera")
+                    }
+                    val uri = contentResolver.insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, values)
+                    if (uri != null) {
+                        contentResolver.openOutputStream(uri)?.use { os ->
+                            f.inputStream().use { input -> input.copyTo(os) }
+                        }
+                        showToast("Video saved to gallery")
+                    } else {
+                        showToast("Could not save video")
+                    }
+                } catch (e: Throwable) {
+                    logError("videoSave", e)
+                }
+            }
+        } catch (e: Throwable) {
+            logError("videoExecutor", e)
+        }
     }
 
     // ------------------------------------------------------------------
@@ -819,7 +1240,7 @@ class MainActivity : Activity() {
     // Camera selection
     // ------------------------------------------------------------------
 
-    // Finds rear (ID "0"), front, and ultrawide (smallest focal back camera).
+    // Finds rear (ID "0"), front, and ultrawide (shortest focal back camera).
     private fun pickCameraIds() {
         if (rearId != null) return
         val manager = getSystemService(Context.CAMERA_SERVICE) as CameraManager
@@ -990,10 +1411,10 @@ class MainActivity : Activity() {
         return min(6, range.upper)
     }
 
+    // Builds the session: preview + photo reader normally, or preview + recorder while recording.
     private fun createCameraPreviewSession() {
         try {
             val device = cameraDevice ?: return
-            val reader = imageReader ?: return
             val texture = textureView.surfaceTexture
             if (texture == null) {
                 showDebug("Preview surface not ready yet")
@@ -1004,13 +1425,32 @@ class MainActivity : Activity() {
             val surface = Surface(texture)
             previewSurface = surface
 
-            val builder = device.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW)
+            val rec: MediaRecorder? = if (isRecording) recorder else null
+            val outputs = ArrayList<Surface>()
+            outputs.add(surface)
+            if (rec != null) {
+                outputs.add(rec.surface)
+            } else {
+                val reader = imageReader ?: return
+                outputs.add(reader.surface)
+            }
+
+            val builder = device.createCaptureRequest(
+                if (rec != null) CameraDevice.TEMPLATE_RECORD else CameraDevice.TEMPLATE_PREVIEW
+            )
             builder.addTarget(surface)
+            if (rec != null) {
+                builder.addTarget(rec.surface)
+                builder.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, Range(recordFps, recordFps))
+                builder.set(
+                    CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE,
+                    CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE_ON
+                )
+            }
             applyCommon(builder)
             previewBuilder = builder
 
-            val surfaces = listOf(surface, reader.surface)
-            device.createCaptureSession(surfaces, object : CameraCaptureSession.StateCallback() {
+            device.createCaptureSession(outputs, object : CameraCaptureSession.StateCallback() {
                 override fun onConfigured(session: CameraCaptureSession) {
                     if (cameraDevice == null) {
                         session.close()
@@ -1019,6 +1459,7 @@ class MainActivity : Activity() {
                     captureSession = session
                     try {
                         session.setRepeatingRequest(builder.build(), null, backgroundHandler)
+                        if (rec != null && isRecording) rec.start()
                     } catch (e: Throwable) {
                         logError("setRepeatingRequest", e)
                     }
@@ -1026,7 +1467,7 @@ class MainActivity : Activity() {
 
                 override fun onConfigureFailed(session: CameraCaptureSession) {
                     logMsg("session", "configure failed (useJpeg=" + useJpeg + ")")
-                    if (!useJpeg) {
+                    if (!useJpeg && rec == null) {
                         useJpeg = true
                         backgroundHandler?.post {
                             closeCamera()
@@ -1040,7 +1481,7 @@ class MainActivity : Activity() {
         }
     }
 
-    // Re-sends the live preview request so flash, torch, zoom and night apply at once.
+    // Re-sends the live request so flash, torch, zoom and night apply at once.
     private fun applyPreviewSettings() {
         val b = previewBuilder ?: return
         val s = captureSession ?: return
@@ -1063,6 +1504,7 @@ class MainActivity : Activity() {
     }
 
     private fun captureBurst() {
+        if (isRecording) return
         if (!burstInProgress.compareAndSet(false, true)) return
         val id = burstId.incrementAndGet()
         try {
@@ -1326,6 +1768,38 @@ class MainActivity : Activity() {
         }
     }
 
+    // Shutter: solid white for photo. In video it shows a red dot, or a red square while recording.
+    private class ShutterView(context: Context) : View(context) {
+        var videoMode = false
+        var recording = false
+        private val whitePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.parseColor("#FAFAF7")
+            style = Paint.Style.FILL
+        }
+        private val redPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.parseColor("#F0524A")
+            style = Paint.Style.FILL
+        }
+        private val rect = RectF()
+
+        override fun onDraw(canvas: Canvas) {
+            super.onDraw(canvas)
+            val cx = width / 2f
+            val cy = height / 2f
+            val r = width / 2f
+            canvas.drawCircle(cx, cy, r, whitePaint)
+            if (videoMode) {
+                if (recording) {
+                    val half = r * 0.45f
+                    rect.set(cx - half, cy - half, cx + half, cy + half)
+                    canvas.drawRoundRect(rect, half * 0.25f, half * 0.25f, redPaint)
+                } else {
+                    canvas.drawCircle(cx, cy, r * 0.78f, redPaint)
+                }
+            }
+        }
+    }
+
     // Line icons drawn with Canvas. state and label change how they look.
     private class IconView(context: Context, private val kind: String) : View(context) {
         var state = 0
@@ -1398,6 +1872,15 @@ class MainActivity : Activity() {
                     }
                     p.style = Paint.Style.STROKE
                 }
+                "gear" -> {
+                    canvas.drawCircle(cx, cy, r, p)
+                    canvas.drawCircle(cx, cy, r * 0.35f, p)
+                }
+                "close" -> {
+                    canvas.drawLine(cx - r, cy - r, cx + r, cy + r, p)
+                    canvas.drawLine(cx + r, cy - r, cx - r, cy + r, p)
+                }
+                "more" -> canvas.drawCircle(cx, cy, r * 1.25f, p)
             }
         }
 
