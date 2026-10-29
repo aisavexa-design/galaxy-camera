@@ -7,7 +7,6 @@ import android.graphics.Rect
 import java.io.File
 import java.io.FileOutputStream
 import kotlin.math.abs
-import kotlin.math.floor
 import kotlin.math.max
 import kotlin.math.min
 
@@ -95,7 +94,7 @@ class ImageProcessor(private val log: (String, String, Throwable?) -> Unit) {
                     decs[s.idx] = BitmapRegionDecoder.newInstance(frames[s.idx].absolutePath, false)
                         ?: throw IllegalStateException("region decoder failed")
                 }
-                enhanced = upscale2x(
+                enhanced = toBitmap(
                     sharpenAndColor(mergeBands(aligned, best, decs, fullW, fullH), fullW, fullH),
                     fullW,
                     fullH
@@ -316,66 +315,18 @@ class ImageProcessor(private val log: (String, String, Throwable?) -> Unit) {
         return (c * 255f + 0.5f).toInt().toByte()
     }
 
-    private fun cubic(x: Float): Float {
-        val ax = abs(x)
-        return when {
-            ax <= 1f -> (1.5f * ax - 2.5f) * ax * ax + 1f
-            ax < 2f -> ((-0.5f * ax + 2.5f) * ax - 4f) * ax + 2f
-            else -> 0f
-        }
-    }
-
-    private fun upscale2x(src: ByteArray, w: Int, h: Int): Bitmap {
-        val ow = w * 2
-        val oh = h * 2
-        val xi = IntArray(ow * 4)
-        val xw = FloatArray(ow * 4)
-        for (ox in 0 until ow) {
-            val sx = (ox + 0.5f) / 2f - 0.5f
-            val ix = floor(sx).toInt()
-            val fx = sx - ix
-            for (k in 0..3) {
-                xi[ox * 4 + k] = (ix + k - 1).coerceIn(0, w - 1)
-                xw[ox * 4 + k] = cubic(fx - (k - 1))
+    private fun toBitmap(src: ByteArray, w: Int, h: Int): Bitmap {
+        val bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+        val row = IntArray(w)
+        for (y in 0 until h) {
+            for (x in 0 until w) {
+                val p = (y * w + x) * 3
+                val r = src[p].toInt() and 0xFF
+                val g = src[p + 1].toInt() and 0xFF
+                val b = src[p + 2].toInt() and 0xFF
+                row[x] = (0xFF shl 24) or (r shl 16) or (g shl 8) or b
             }
-        }
-        val yi = IntArray(oh * 4)
-        val yw = FloatArray(oh * 4)
-        for (oy in 0 until oh) {
-            val sy = (oy + 0.5f) / 2f - 0.5f
-            val iy = floor(sy).toInt()
-            val fy = sy - iy
-            for (k in 0..3) {
-                yi[oy * 4 + k] = (iy + k - 1).coerceIn(0, h - 1)
-                yw[oy * 4 + k] = cubic(fy - (k - 1))
-            }
-        }
-
-        val bmp = Bitmap.createBitmap(ow, oh, Bitmap.Config.ARGB_8888)
-        val row = IntArray(ow)
-        for (oy in 0 until oh) {
-            for (ox in 0 until ow) {
-                var r = 0f
-                var g = 0f
-                var b = 0f
-                for (ky in 0..3) {
-                    val yy = yi[oy * 4 + ky]
-                    val wy = yw[oy * 4 + ky]
-                    for (kx in 0..3) {
-                        val xx = xi[ox * 4 + kx]
-                        val wgt = wy * xw[ox * 4 + kx]
-                        val p = (yy * w + xx) * 3
-                        r += (src[p].toInt() and 0xFF) * wgt
-                        g += (src[p + 1].toInt() and 0xFF) * wgt
-                        b += (src[p + 2].toInt() and 0xFF) * wgt
-                    }
-                }
-                val rr = (r + 0.5f).toInt().coerceIn(0, 255)
-                val gg = (g + 0.5f).toInt().coerceIn(0, 255)
-                val bb = (b + 0.5f).toInt().coerceIn(0, 255)
-                row[ox] = (0xFF shl 24) or (rr shl 16) or (gg shl 8) or bb
-            }
-            bmp.setPixels(row, 0, ow, 0, oy, ow, 1)
+            bmp.setPixels(row, 0, w, 0, y, w, 1)
         }
         return bmp
     }
