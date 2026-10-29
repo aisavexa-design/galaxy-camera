@@ -41,6 +41,7 @@ import android.util.Size
 import android.view.Gravity
 import android.view.KeyEvent
 import android.view.MotionEvent
+import android.view.ScaleGestureDetector
 import android.view.Surface
 import android.view.TextureView
 import android.view.View
@@ -61,6 +62,8 @@ import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
+import kotlin.math.abs
+import kotlin.math.ln
 import kotlin.math.min
 
 class MainActivity : Activity() {
@@ -76,11 +79,14 @@ class MainActivity : Activity() {
     private lateinit var iconRes: IconView
     private lateinit var moonView: IconView
     private lateinit var zoomPill: LinearLayout
+    private lateinit var zoomLabel: TextView
+    private lateinit var zoomRuler: ZoomRulerView
     private lateinit var dotsBar: LinearLayout
     private lateinit var dotFlash: IconView
     private lateinit var dotTimer: IconView
     private lateinit var dotRatio: IconView
     private lateinit var dotRes: IconView
+    private lateinit var scaleDetector: ScaleGestureDetector
     private val zoomViews = ArrayList<TextView>()
     private val modeViews = ArrayList<TextView>()
     private var moreOverlay: FrameLayout? = null
@@ -89,6 +95,8 @@ class MainActivity : Activity() {
     private var uiReady = false
     private var screenWpx = 1080
     private var screenHpx = 2340
+    private var hideZoomRunnable: Runnable? = null
+    private var pendingRestart = false
 
     // Settings (saved in SharedPreferences)
     private var flashMode = 0          // 0 off, 1 on at capture, 2 torch
@@ -96,7 +104,7 @@ class MainActivity : Activity() {
     private var squareMode = false     // false = 3:4, true = 1:1
     private var highRes = true         // true = 12M, false = 3M
     private var nightOn = false
-    private var zoomLevel = 1f         // 1 or 2 (digital)
+    private var zoomLevel = 1f         // 1x to 10x digital
     private var useUltra = false       // true = 0.5x ultrawide
     private var isFront = false
     private var activeMode = "PHOTO"
@@ -211,10 +219,10 @@ class MainActivity : Activity() {
         }
     }
 
-    // Volume keys take the photo (or start/stop video), just like the shutter.
+    // Volume keys take the photo (or start/stop video), if the setting is on.
     override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {
         if (keyCode == KeyEvent.KEYCODE_VOLUME_UP || keyCode == KeyEvent.KEYCODE_VOLUME_DOWN) {
-            if (event?.repeatCount == 0 && uiReady) {
+            if (event?.repeatCount == 0 && uiReady && prefs().getBoolean("set_volume_shutter", true)) {
                 onShutter()
             }
             return true
@@ -236,7 +244,7 @@ class MainActivity : Activity() {
         squareMode = p.getBoolean("square", false)
         highRes = p.getBoolean("highres", true)
         nightOn = p.getBoolean("night", false)
-        zoomLevel = p.getFloat("zoom", 1f)
+        zoomLevel = p.getFloat("zoom", 1f).coerceIn(1f, 10f)
         useUltra = p.getBoolean("ultra", false)
         isFront = p.getBoolean("front", false)
         activeMode = p.getString("mode", "PHOTO") ?: "PHOTO"
@@ -304,6 +312,8 @@ class MainActivity : Activity() {
     }
 
     private fun showDebug(text: String) {
+        // Debug overlay only shows when the setting is on.
+        if (!prefs().getBoolean("set_debug", false)) return
         synchronized(debugLines) {
             debugLines.add(text)
             while (debugLines.size > 5) debugLines.removeAt(0)
@@ -399,9 +409,14 @@ class MainActivity : Activity() {
         rootView = FrameLayout(this)
         rootView.setBackgroundColor(Color.BLACK)
 
-        // Preview
+        // Preview, with pinch zoom
         textureView = TextureView(this)
         textureView.surfaceTextureListener = surfaceTextureListener
+        scaleDetector = ScaleGestureDetector(this, pinchListener)
+        textureView.setOnTouchListener { _, e ->
+            scaleDetector.onTouchEvent(e)
+            true
+        }
         val textureParams = FrameLayout.LayoutParams(screenWpx, previewHeightPx())
         textureParams.topMargin = (screenHpx * 0.081f).toInt()
         rootView.addView(textureView, textureParams)
@@ -477,6 +492,37 @@ class MainActivity : Activity() {
         moonParams.topMargin = (screenHpx * 0.66f - moonSize / 2f).toInt()
         moonView.setOnClickListener { toggleNight() }
         rootView.addView(moonView, moonParams)
+
+        // Zoom number label (shows while zooming)
+        zoomLabel = TextView(this).apply {
+            text = "1.0x"
+            setTextColor(Color.WHITE)
+            typeface = Typeface.DEFAULT_BOLD
+            textSize = 14f
+            setPadding(24, 6, 24, 6)
+            background = roundRect(Color.parseColor("#88000000"), 200f)
+            alpha = 0f
+        }
+        val zoomLabelParams = FrameLayout.LayoutParams(
+            FrameLayout.LayoutParams.WRAP_CONTENT,
+            FrameLayout.LayoutParams.WRAP_CONTENT
+        ).apply {
+            gravity = Gravity.CENTER_HORIZONTAL
+            topMargin = (screenHpx * 0.625f).toInt()
+        }
+        rootView.addView(zoomLabel, zoomLabelParams)
+
+        // Zoom ruler line (shows while zooming)
+        zoomRuler = ZoomRulerView(this)
+        zoomRuler.alpha = 0f
+        val rulerParams = FrameLayout.LayoutParams(
+            (screenWpx * 0.8f).toInt(),
+            (screenHpx * 0.045f).toInt()
+        ).apply {
+            leftMargin = (screenWpx * 0.1f).toInt()
+            topMargin = (screenHpx * 0.66f).toInt()
+        }
+        rootView.addView(zoomRuler, rulerParams)
 
         // Zoom pill: .5 | 1x | 2
         zoomPill = buildZoomPill()
@@ -644,7 +690,7 @@ class MainActivity : Activity() {
         for (v in views) {
             bar.addView(v, LinearLayout.LayoutParams(cell, cell))
         }
-        gear.setOnClickListener { showToast("Settings is in the next step") }
+        gear.setOnClickListener { startActivity(Intent(this, SettingsActivity::class.java)) }
         dotFlash.setOnClickListener { cycleFlash() }
         dotTimer.setOnClickListener { cycleTimer() }
         dotRatio.setOnClickListener { toggleRatio() }
@@ -705,12 +751,19 @@ class MainActivity : Activity() {
         updateShutter()
     }
 
+    // Highlights the preset (0.5x, 1x or 2x) that matches the current zoom.
     private fun updateZoomPill() {
         val video = activeMode == "VIDEO"
         if (zoomViews.isNotEmpty()) {
             zoomViews[0].visibility = if (video) View.GONE else View.VISIBLE
         }
-        val sel = if (useUltra) 0 else if (zoomLevel > 1.5f) 2 else 1
+        val z = currentZoomValue()
+        val sel = when {
+            abs(z - 0.5f) < 0.05f -> 0
+            abs(z - 1f) < 0.05f -> 1
+            abs(z - 2f) < 0.05f -> 2
+            else -> -1
+        }
         for (i in zoomViews.indices) {
             val tv = zoomViews[i]
             tv.background = if (i == sel) oval(Color.parseColor("#AA777777")) else null
@@ -776,6 +829,101 @@ class MainActivity : Activity() {
     }
 
     // ------------------------------------------------------------------
+    // Zoom (buttons and pinch)
+    // ------------------------------------------------------------------
+
+    private fun currentZoomValue(): Float = if (useUltra) 0.5f else zoomLevel
+
+    private fun zoomText(): String = String.format(Locale.US, "%.1fx", currentZoomValue())
+
+    // Shows the zoom number and ruler line, then hides them after a short pause.
+    private fun showZoomUi() {
+        zoomLabel.text = zoomText()
+        zoomLabel.animate().cancel()
+        zoomLabel.alpha = 1f
+        zoomRuler.level = currentZoomValue()
+        zoomRuler.invalidate()
+        zoomRuler.animate().cancel()
+        zoomRuler.alpha = 1f
+        hideZoomRunnable?.let { uiHandler.removeCallbacks(it) }
+        val hide = Runnable {
+            zoomLabel.animate().alpha(0f).setDuration(300).start()
+            zoomRuler.animate().alpha(0f).setDuration(300).start()
+        }
+        hideZoomRunnable = hide
+        uiHandler.postDelayed(hide, 1500L)
+    }
+
+    private val pinchListener = object : ScaleGestureDetector.SimpleOnScaleGestureListener() {
+        override fun onScale(d: ScaleGestureDetector): Boolean {
+            if (!uiReady) return false
+            if (useUltra) {
+                // Pinch out from 0.5x goes back to the main camera at 1x.
+                if (d.scaleFactor > 1f && !isRecording) {
+                    useUltra = false
+                    zoomLevel = 1f
+                    pendingRestart = true
+                }
+            } else {
+                zoomLevel = (zoomLevel * d.scaleFactor).coerceIn(1f, 10f)
+                applyPreviewSettings()
+            }
+            updateZoomPill()
+            showZoomUi()
+            return true
+        }
+
+        override fun onScaleEnd(d: ScaleGestureDetector) {
+            savePrefs()
+            if (pendingRestart) {
+                pendingRestart = false
+                restartCamera()
+            }
+            updateAllIcons()
+        }
+    }
+
+    private fun setZoom(z: Float) {
+        if (!uiReady) return
+        pickCameraIds()
+        if (z < 1f) {
+            if (isFront || ultraId == null) {
+                showToast("Ultra wide not available")
+                return
+            }
+            if (isRecording) {
+                showToast("Stop recording first")
+                return
+            }
+            useUltra = true
+            zoomLevel = 1f
+            savePrefs()
+            updateAllIcons()
+            showZoomUi()
+            restartCamera()
+            return
+        }
+        if (useUltra) {
+            if (isRecording) {
+                showToast("Stop recording first")
+                return
+            }
+            useUltra = false
+            zoomLevel = z
+            savePrefs()
+            updateAllIcons()
+            showZoomUi()
+            restartCamera()
+        } else {
+            zoomLevel = z
+            savePrefs()
+            updateAllIcons()
+            showZoomUi()
+            applyPreviewSettings()
+        }
+    }
+
+    // ------------------------------------------------------------------
     // Icon actions
     // ------------------------------------------------------------------
 
@@ -834,35 +982,6 @@ class MainActivity : Activity() {
         updateAllIcons()
         applyPreviewSettings()
         showToast(if (nightOn) "Night on" else "Night off")
-    }
-
-    private fun setZoom(z: Float) {
-        if (blockedWhileRecording()) return
-        pickCameraIds()
-        if (z < 1f) {
-            if (isFront || ultraId == null) {
-                showToast("Ultra wide not available")
-                return
-            }
-            useUltra = true
-            zoomLevel = 1f
-            savePrefs()
-            updateAllIcons()
-            restartCamera()
-            return
-        }
-        if (useUltra) {
-            useUltra = false
-            zoomLevel = z
-            savePrefs()
-            updateAllIcons()
-            restartCamera()
-        } else {
-            zoomLevel = z
-            savePrefs()
-            updateAllIcons()
-            applyPreviewSettings()
-        }
     }
 
     private fun switchCamera() {
@@ -978,7 +1097,6 @@ class MainActivity : Activity() {
         )
         moreOverlay = overlay
 
-        // Animations: dim fades in, card slides up, items pop one by one.
         overlay.alpha = 0f
         overlay.animate().alpha(1f).setDuration(200).start()
         card.translationY = screenHpx * 0.5f
@@ -1151,7 +1269,7 @@ class MainActivity : Activity() {
         }
     }
 
-    // stopPreview = true restarts the normal photo preview afterwards.
+    // restartPreview = true brings back the normal photo preview afterwards.
     private fun stopRecording(restartPreview: Boolean) {
         if (!isRecording) return
         isRecording = false
@@ -1383,7 +1501,7 @@ class MainActivity : Activity() {
         }
     }
 
-    // Applies flash, torch, zoom crop and night exposure to any request builder.
+    // Applies focus, flash, torch, zoom crop and night exposure to any request builder.
     private fun applyCommon(b: CaptureRequest.Builder) {
         b.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
         b.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON)
@@ -1394,11 +1512,12 @@ class MainActivity : Activity() {
         if (chars != null) applyCrop(b, chars)
     }
 
+    // Always sets the crop region, so going back to 1x restores the full frame.
     private fun applyCrop(b: CaptureRequest.Builder, chars: CameraCharacteristics) {
-        if (zoomLevel <= 1.01f || useUltra) return
         val arr = chars.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE) ?: return
-        val cw = (arr.width() / zoomLevel).toInt()
-        val ch = (arr.height() / zoomLevel).toInt()
+        val z = if (useUltra) 1f else zoomLevel.coerceIn(1f, 10f)
+        val cw = (arr.width() / z).toInt()
+        val ch = (arr.height() / z).toInt()
         val l = arr.left + (arr.width() - cw) / 2
         val t = arr.top + (arr.height() - ch) / 2
         b.set(CaptureRequest.SCALER_CROP_REGION, Rect(l, t, l + cw, t + ch))
@@ -1765,6 +1884,49 @@ class MainActivity : Activity() {
             super.onDraw(canvas)
             val radius = width / 2f
             canvas.drawCircle(radius, radius, radius, paint)
+        }
+    }
+
+    // Horizontal zoom line with marks at 0.5x, 1x, 2x, 5x, 10x, and a dot at the current zoom.
+    // The scale is logarithmic, so 1x to 2x takes the same space as 2x to 4x.
+    private class ZoomRulerView(context: Context) : View(context) {
+        var level = 1f
+        private val linePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.WHITE
+            strokeWidth = 4f
+            style = Paint.Style.STROKE
+        }
+        private val dotPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.WHITE
+            style = Paint.Style.FILL
+        }
+        private val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.WHITE
+            textSize = 26f
+            textAlign = Paint.Align.CENTER
+        }
+        private val marks = listOf(0.5f to "0.5x", 1f to "1x", 2f to "2x", 5f to "5x", 10f to "10x")
+
+        private fun posOf(z: Float): Float {
+            val lo = ln(0.5f)
+            val hi = ln(10f)
+            return ((ln(z.coerceIn(0.5f, 10f)) - lo) / (hi - lo)).coerceIn(0f, 1f)
+        }
+
+        override fun onDraw(canvas: Canvas) {
+            super.onDraw(canvas)
+            val padX = 40f
+            val y = height * 0.6f
+            val left = padX
+            val right = width - padX
+            canvas.drawLine(left, y, right, y, linePaint)
+            for ((value, label) in marks) {
+                val x = left + posOf(value) * (right - left)
+                canvas.drawLine(x, y - 12f, x, y + 12f, linePaint)
+                canvas.drawText(label, x, y - 22f, textPaint)
+            }
+            val dx = left + posOf(level) * (right - left)
+            canvas.drawCircle(dx, y, 14f, dotPaint)
         }
     }
 
