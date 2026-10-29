@@ -11,7 +11,7 @@ import kotlin.math.floor
 import kotlin.math.max
 import kotlin.math.min
 
-class ImageProcessor(private val log: (String, Throwable?) -> Unit) {
+class ImageProcessor(private val log: (String, String, Throwable?) -> Unit) {
 
     class Result(val file: File, val usedFallback: Boolean)
 
@@ -38,7 +38,7 @@ class ImageProcessor(private val log: (String, Throwable?) -> Unit) {
                 }
             }
             fallbackIdx = best
-            log("sharp", "reference frame " + (best + 1))
+            log("sharp", "reference frame " + (best + 1), null)
 
             val ref4 = g4[best]
             val ref2 = loadGray(frames[best], 2)
@@ -74,11 +74,11 @@ class ImageProcessor(private val log: (String, Throwable?) -> Unit) {
                         }
                     }
                 }
-                log("align", "frame " + (k + 1) + " shift " + (rdx * 2) + "," + (rdy * 2) + " err " + re)
+                log("align", "frame " + (k + 1) + " shift " + (rdx * 2) + "," + (rdy * 2) + " err " + re, null)
                 if (re <= ALIGN_MAX_ERR) {
                     aligned.add(Shift(k, rdx * 2, rdy * 2))
                 } else {
-                    log("align", "frame " + (k + 1) + " skipped (too different)")
+                    log("align", "frame " + (k + 1) + " skipped (too different)", null)
                 }
             }
 
@@ -103,17 +103,17 @@ class ImageProcessor(private val log: (String, Throwable?) -> Unit) {
             } finally {
                 for (d in decs.values) d.recycle()
             }
-            log("merge", "merged " + aligned.size + " frames")
+            log("merge", "merged " + aligned.size + " frames", null)
 
             FileOutputStream(outFile).use { enhanced.compress(Bitmap.CompressFormat.JPEG, 95, it) }
             enhanced.recycle()
             return Result(outFile, false)
         } catch (t: Throwable) {
-            log("pipeline", t)
+            log("pipeline", "failed, saving sharpest frame", t)
             try {
                 frames[fallbackIdx].copyTo(outFile, overwrite = true)
             } catch (e: Throwable) {
-                log("fallback", e)
+                log("fallback", "copy failed", e)
             }
             return Result(outFile, true)
         }
@@ -151,6 +151,7 @@ class ImageProcessor(private val log: (String, Throwable?) -> Unit) {
                 n++
             }
         }
+        if (n == 0) return 0.0
         val mean = sum / n
         return sum2 / n - mean * mean
     }
@@ -178,6 +179,7 @@ class ImageProcessor(private val log: (String, Throwable?) -> Unit) {
             }
             y += step
         }
+        if (n == 0L) return Double.MAX_VALUE
         return sum.toDouble() / n.toDouble()
     }
 
@@ -225,9 +227,9 @@ class ImageProcessor(private val log: (String, Throwable?) -> Unit) {
                     val c = pix[i]
                     val ok = isRef || abs(lum(c) - lum(refBand[i])) <= GHOST_THRESH
                     if (ok) {
-                        sr[i] += (c shr 16) and 0xFF
-                        sg[i] += (c shr 8) and 0xFF
-                        sb[i] += c and 0xFF
+                        sr[i] += ((c shr 16) and 0xFF).toFloat()
+                        sg[i] += ((c shr 8) and 0xFF).toFloat()
+                        sb[i] += (c and 0xFF).toFloat()
                         wt[i] += 1f
                     }
                 }
