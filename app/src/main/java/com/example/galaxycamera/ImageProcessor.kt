@@ -246,17 +246,17 @@ class ImageProcessor(private val log: (String, String, Throwable?) -> Unit) {
         return out
     }
 
-    // Auto exposure control, neutral white balance, haze and glow compression,
-    // warm-skin correction, sharpening, saturation, and NV21 output.
+    // Exposure control from the brightness histogram, neutral white balance,
+    // gentle contrast, haze control, warm-skin fix, sharpening, saturation, NV21 output.
     private fun toneAndColorNv21(src: ByteArray, w: Int, h: Int): ByteArray {
         val total = w * h
 
-        // Pass 1: white balance from neutral pixels, and the average brightness.
+        // Pass 1: white balance from neutral pixels, and a brightness histogram.
         var sumR = 0L
         var sumG = 0L
         var sumB = 0L
         var cnt = 0L
-        var sumY = 0.0
+        val hist = IntArray(256)
         var p = 0
         for (k in 0 until total) {
             val pr = src[p].toInt() and 0xFF
@@ -270,9 +270,11 @@ class ImageProcessor(private val log: (String, String, Throwable?) -> Unit) {
                 sumB += pb
                 cnt++
             }
-            sumY += 0.299 * pr + 0.587 * pg + 0.114 * pb
+            val yv = (0.299f * pr + 0.587f * pg + 0.114f * pb + 0.5f).toInt().coerceIn(0, 255)
+            hist[yv]++
             p += 3
         }
+
         var gainR = 1f
         var gainG = 1f
         var gainB = 1f
@@ -286,9 +288,20 @@ class ImageProcessor(private val log: (String, String, Throwable?) -> Unit) {
             gainB = (mGray / mB).coerceIn(0.97f, 1.03f)
         }
 
-        // Auto exposure: if the whole frame is bright, pull it down a little.
-        val meanY = (sumY / total / 255.0).toFloat()
-        val expScale = if (meanY > 0.5f) (0.5f / meanY).coerceIn(0.8f, 1f) else 1f
+        // Find the 98th percentile brightness. If the bright end is blown out,
+        // scale the whole frame down so highlights land near 0.9.
+        val target = (total * 0.98).toLong()
+        var acc = 0L
+        var p98 = 255
+        for (b in 0..255) {
+            acc += hist[b]
+            if (acc >= target) {
+                p98 = b
+                break
+            }
+        }
+        val hi = p98 / 255f
+        val expScale = if (hi > 0.9f) (0.9f / hi).coerceIn(0.7f, 1f) else 1f
 
         val out = ByteArray(total * 3 / 2)
         val uvBase = total
@@ -309,25 +322,12 @@ class ImageProcessor(private val log: (String, String, Throwable?) -> Unit) {
                     }
                 }
                 val edge = abs(gC - sumG2.toFloat() / count)
-                val amount = if (edge > 6f) 1.0f else 0.4f
+                val amount = if (edge > 6f) 0.9f else 0.3f
 
-                // Shadow denoise on flat dark areas, sharpening elsewhere.
-                val rawY = 0.299f * (src[i].toInt() and 0xFF) +
-                    0.587f * (src[i + 1].toInt() and 0xFF) +
-                    0.114f * (src[i + 2].toInt() and 0xFF)
-                val flatShadow = rawY < 70f && edge < 8f
-                var r: Float
-                var g: Float
-                var b: Float
-                if (flatShadow) {
-                    r = meanChannel(src, w, ya, yb, xa, xb, count, 0) / 255f * gainR
-                    g = meanChannel(src, w, ya, yb, xa, xb, count, 1) / 255f * gainG
-                    b = meanChannel(src, w, ya, yb, xa, xb, count, 2) / 255f * gainB
-                } else {
-                    r = sharpChannel(src, w, ya, yb, xa, xb, count, i, 0, amount) / 255f * gainR
-                    g = sharpChannel(src, w, ya, yb, xa, xb, count, i, 1, amount) / 255f * gainG
-                    b = sharpChannel(src, w, ya, yb, xa, xb, count, i, 2, amount) / 255f * gainB
-                }
+                var r = sharpChannel(src, w, ya, yb, xa, xb, count, i, 0, amount) / 255f * gainR
+                var g = sharpChannel(src, w, ya, yb, xa, xb, count, i, 1, amount) / 255f * gainG
+                var b = sharpChannel(src, w, ya, yb, xa, xb, count, i, 2, amount) / 255f * gainB
+
                 r = (r * expScale).coerceIn(0f, 1f)
                 g = (g * expScale).coerceIn(0f, 1f)
                 b = (b * expScale).coerceIn(0f, 1f)
@@ -343,10 +343,10 @@ class ImageProcessor(private val log: (String, String, Throwable?) -> Unit) {
                 val green = d0 > 0.05f && hue >= 70f && hue <= 170f
                 val pinkCast = d0 > 0.04f && hue >= 280f && hue <= 350f
 
-                // Warm skin fix: take a little red out and add a little blue.
+                // Warm skin fix: a little less red, a little more blue.
                 if (skin) {
-                    r *= 0.96f
-                    b *= 1.03f
+                    r *= 0.97f
+                    b *= 1.02f
                 }
 
                 // Pink cast removal on ground and twigs.
@@ -357,22 +357,26 @@ class ImageProcessor(private val log: (String, String, Throwable?) -> Unit) {
                     b = m + (b - m) * 0.7f
                 }
 
-                // Brightness curve: lift shadows a bit, roll off highlights.
+                // Shadow lift, kept small. Highlights are rolled off.
                 var ratio = if (y0 > 0.0001f) toneY(y0) / y0 else 1f
-                ratio = min(ratio, 1.35f)
+                ratio = min(ratio, 1.15f)
                 if (sky && ratio > 1f) ratio = 1f
-                if (skin && y0 < 0.5f) ratio *= 1.04f
-                if (green && y0 < 0.6f) ratio *= 1.05f
+                if (green && y0 < 0.5f) ratio *= 1.03f
 
                 r *= ratio
                 g *= ratio
                 b *= ratio
 
-                // Haze and glow: bright, low-colour pixels (sky, white wall, shine) are compressed.
+                // Gentle S-curve for contrast, so the image does not look flat or washed.
+                r = sCurve(r)
+                g = sCurve(g)
+                b = sCurve(b)
+
+                // Haze control: only very bright, low-colour pixels (white glare, bright sky) are pulled down.
                 val lumNow = 0.299f * r + 0.587f * g + 0.114f * b
                 val chromaNow = max(r, max(g, b)) - min(r, min(g, b))
-                if (lumNow > 0.7f && chromaNow < 0.18f) {
-                    val k = (1f - (lumNow - 0.7f) * 1.2f).coerceIn(0.7f, 1f)
+                if (lumNow > 0.85f && chromaNow < 0.1f) {
+                    val k = (1f - (lumNow - 0.85f) * 1.0f).coerceIn(0.85f, 1f)
                     r *= k
                     g *= k
                     b *= k
@@ -392,20 +396,19 @@ class ImageProcessor(private val log: (String, String, Throwable?) -> Unit) {
                     b /= peak
                 }
 
-                // Saturation: green strongest, other colours a bit, sky a bit,
-                // skin and near-white left alone.
+                // Saturation: green strongest, other colours a bit, skin and near-white left alone.
                 val yy = 0.299f * r + 0.587f * g + 0.114f * b
                 var sat = 1.0f
                 if (sky) {
-                    sat = 1.10f
+                    sat = 1.08f
                 } else if (skin) {
                     sat = 1.0f
                 } else if (green) {
-                    sat = 1.30f
+                    sat = 1.25f
                 } else if (d0 > 0.05f && inBoostHue(hue)) {
-                    sat = 1.12f
+                    sat = 1.10f
                 } else if (d0 > 0.05f) {
-                    sat = 1.04f
+                    sat = 1.03f
                 }
                 if (yy > 0.85f) {
                     val fade = ((1f - yy) / 0.15f).coerceIn(0f, 1f)
@@ -418,8 +421,8 @@ class ImageProcessor(private val log: (String, String, Throwable?) -> Unit) {
                 val rr = r * 255f
                 val gg = g * 255f
                 val bb = b * 255f
-                val yv = 0.299f * rr + 0.587f * gg + 0.114f * bb
-                out[y * w + x] = (yv + 0.5f).toInt().coerceIn(0, 255).toByte()
+                val yOut = 0.299f * rr + 0.587f * gg + 0.114f * bb
+                out[y * w + x] = (yOut + 0.5f).toInt().coerceIn(0, 255).toByte()
 
                 if ((y and 1) == 0 && (x and 1) == 0) {
                     val u = -0.169f * rr - 0.331f * gg + 0.5f * bb + 128f
@@ -433,14 +436,21 @@ class ImageProcessor(private val log: (String, String, Throwable?) -> Unit) {
         return out
     }
 
-    // Gamma 0.8 lifts shadows and midtones. Above 0.85 highlights roll off gently.
+    // Gentle lift for shadows and midtones, soft roll-off above 0.85.
     private fun toneY(v: Float): Float {
         val x = v.coerceIn(0f, 1f)
         return if (x <= 0.85f) {
-            Math.pow(x.toDouble(), 0.8).toFloat()
+            Math.pow(x.toDouble(), 0.9).toFloat()
         } else {
-            (0.878f + (x - 0.85f) * 0.5f).coerceIn(0f, 1f)
+            (0.88f + (x - 0.85f) * 0.5f).coerceIn(0f, 1f)
         }
+    }
+
+    // Mild S-curve: 75% linear, 25% smoothstep.
+    private fun sCurve(v: Float): Float {
+        val x = v.coerceIn(0f, 1f)
+        val s = x * x * (3f - 2f * x)
+        return (x * 0.75f + s * 0.25f).coerceIn(0f, 1f)
     }
 
     // Blue sky: blue clearly dominates and the pixel is reasonably bright.
