@@ -76,14 +76,16 @@ class MainActivity : Activity() {
     private var frontId: String? = null
     private var cameraId: String? = null
     private var isFront = false
-    private var framesPerBurst = 10
+
+    // Single frame for both rear and selfie cameras.
+    private var framesPerBurst = 1
 
     private var backgroundThread: HandlerThread? = null
     private var backgroundHandler: Handler? = null
     private var backgroundExecutor: ExecutorService? = null
 
     private var currentBurstDir: File? = null
-    private var currentBurstTotal = 10
+    private var currentBurstTotal = 1
     private val burstFrameCount = AtomicInteger(0)
     private val burstInProgress = AtomicBoolean(false)
     private val burstId = AtomicInteger(0)
@@ -461,7 +463,7 @@ class MainActivity : Activity() {
         closeCamera()
         isFront = !isFront
         cameraId = target
-        framesPerBurst = if (isFront) 6 else 10
+        framesPerBurst = 1
         openCamera()
     }
 
@@ -504,7 +506,7 @@ class MainActivity : Activity() {
 
         val id = cameraId ?: rearId ?: "0"
         cameraId = id
-        framesPerBurst = if (isFront) 6 else 10
+        framesPerBurst = 1
 
         cameraOpening = true
         val manager = getSystemService(Context.CAMERA_SERVICE) as CameraManager
@@ -661,7 +663,7 @@ class MainActivity : Activity() {
     }
 
     // ------------------------------------------------------------------
-    // Saving frames and Stage 2 processing
+    // Saving frames and processing
     // ------------------------------------------------------------------
 
     private val onImageAvailableListener = ImageReader.OnImageAvailableListener { reader ->
