@@ -31,6 +31,7 @@ import android.provider.MediaStore
 import android.util.Log
 import android.util.Size
 import android.view.Gravity
+import android.view.KeyEvent
 import android.view.MotionEvent
 import android.view.Surface
 import android.view.TextureView
@@ -148,6 +149,17 @@ class MainActivity : Activity() {
             debugText?.visibility = View.GONE
             if (textureView.isAvailable) openCamera()
         }
+    }
+
+    // Volume keys take the photo, just like the shutter button.
+    override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {
+        if (keyCode == KeyEvent.KEYCODE_VOLUME_UP || keyCode == KeyEvent.KEYCODE_VOLUME_DOWN) {
+            if (event?.repeatCount == 0 && uiReady) {
+                captureBurst()
+            }
+            return true
+        }
+        return super.onKeyDown(keyCode, event)
     }
 
     // ------------------------------------------------------------------
