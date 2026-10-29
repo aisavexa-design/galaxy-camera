@@ -23,6 +23,9 @@ class ImageProcessor(private val log: (String, String, Throwable?) -> Unit) {
         private const val BAND = 128
         private const val GHOST_THRESH = 40
         private const val ALIGN_MAX_ERR = 30.0
+        private const val SAT_BOOST_HUE = 1.20f
+        private const val SAT_BASE = 1.06f
+        private const val SAT_SKIN = 1.00f
     }
 
     fun process(frames: List<File>, outFile: File): Result {
@@ -246,11 +249,33 @@ class ImageProcessor(private val log: (String, String, Throwable?) -> Unit) {
         return out
     }
 
-    // Sharpens text and edges, boosts the chosen colours, and converts
-    // directly to NV21 (YUV420) for JPEG output. Only one extra buffer is made.
+    // Gray-world white balance, text/edge sharpening, highlight roll-off,
+    // mild S-curve, hue-aware saturation, and direct NV21 output.
     private fun rgbToSharpNv21(src: ByteArray, w: Int, h: Int): ByteArray {
-        val out = ByteArray(w * h * 3 / 2)
-        val uvBase = w * h
+        val total = w * h
+
+        // Pass 1: average colour of the whole frame for gray-world white balance.
+        var sumR = 0L
+        var sumG = 0L
+        var sumB = 0L
+        var p = 0
+        for (k in 0 until total) {
+            sumR += src[p].toInt() and 0xFF
+            sumG += src[p + 1].toInt() and 0xFF
+            sumB += src[p + 2].toInt() and 0xFF
+            p += 3
+        }
+        val mR = max(sumR.toFloat() / total, 1f)
+        val mG = max(sumG.toFloat() / total, 1f)
+        val mB = max(sumB.toFloat() / total, 1f)
+        val mGray = (mR + mG + mB) / 3f
+        // Blend towards 1.0 so the correction stays gentle and never overdoes it.
+        val gainR = wbGain(mGray / mR)
+        val gainG = wbGain(mGray / mG)
+        val gainB = wbGain(mGray / mB)
+
+        val out = ByteArray(total * 3 / 2)
+        val uvBase = total
         for (y in 0 until h) {
             val ya = if (y > 0) y - 1 else 0
             val yb = if (y < h - 1) y + 1 else h - 1
@@ -261,28 +286,43 @@ class ImageProcessor(private val log: (String, String, Throwable?) -> Unit) {
                 val i = (y * w + x) * 3
 
                 val gC = (src[i + 1].toInt() and 0xFF).toFloat()
-                var sumG = 0
+                var sumG2 = 0
                 for (oy in ya..yb) {
                     for (ox in xa..xb) {
-                        sumG += src[(oy * w + ox) * 3 + 1].toInt() and 0xFF
+                        sumG2 += src[(oy * w + ox) * 3 + 1].toInt() and 0xFF
                     }
                 }
-                val edge = abs(gC - sumG.toFloat() / count)
+                val edge = abs(gC - sumG2.toFloat() / count)
                 val amount = if (edge > 6f) 1.4f else 0.6f
 
-                var r = sharpChannel(src, w, ya, yb, xa, xb, count, i, 0, amount) / 255f
-                var g = sharpChannel(src, w, ya, yb, xa, xb, count, i, 1, amount) / 255f
-                var b = sharpChannel(src, w, ya, yb, xa, xb, count, i, 2, amount) / 255f
+                // Sharpen, then apply white balance.
+                var r = (sharpChannel(src, w, ya, yb, xa, xb, count, i, 0, amount) / 255f * gainR).coerceIn(0f, 1f)
+                var g = (sharpChannel(src, w, ya, yb, xa, xb, count, i, 1, amount) / 255f * gainG).coerceIn(0f, 1f)
+                var b = (sharpChannel(src, w, ya, yb, xa, xb, count, i, 2, amount) / 255f * gainB).coerceIn(0f, 1f)
 
+                // Highlight roll-off and mild S-curve for natural contrast.
+                r = toneCurve(r)
+                g = toneCurve(g)
+                b = toneCurve(b)
+
+                // Hue-aware saturation: strong on the chosen colours, mild elsewhere,
+                // untouched on skin tones.
                 val mx = max(r, max(g, b))
                 val mn = min(r, min(g, b))
                 val d = mx - mn
-                if (d > 0.04f && mx > 0.2f && inBoostHue(hueOf(r, g, b, mx, d))) {
-                    val m = (r + g + b) / 3f
-                    r = (m + (r - m) * 1.30f).coerceIn(0f, 1f)
-                    g = (m + (g - m) * 1.30f).coerceIn(0f, 1f)
-                    b = (m + (b - m) * 1.30f).coerceIn(0f, 1f)
+                var sat = SAT_BASE
+                if (d > 0.04f) {
+                    val hue = hueOf(r, g, b, mx, d)
+                    if (inBoostHue(hue)) {
+                        sat = SAT_BOOST_HUE
+                    } else if (hue >= 8f && hue <= 60f) {
+                        sat = SAT_SKIN
+                    }
                 }
+                val m = (r + g + b) / 3f
+                r = (m + (r - m) * sat).coerceIn(0f, 1f)
+                g = (m + (g - m) * sat).coerceIn(0f, 1f)
+                b = (m + (b - m) * sat).coerceIn(0f, 1f)
 
                 val rr = r * 255f
                 val gg = g * 255f
@@ -300,6 +340,20 @@ class ImageProcessor(private val log: (String, String, Throwable?) -> Unit) {
             }
         }
         return out
+    }
+
+    // Blends the raw gray-world gain towards 1.0, then clamps it.
+    private fun wbGain(raw: Float): Float {
+        val g = 1f + 0.6f * (raw - 1f)
+        return g.coerceIn(0.85f, 1.2f)
+    }
+
+    // Highlight soft roll-off above 0.85, then a gentle S-curve.
+    private fun toneCurve(v: Float): Float {
+        var x = v
+        if (x > 0.85f) x = 0.85f + (x - 0.85f) * 0.6f
+        val s = x * x * (3f - 2f * x)
+        return (x * 0.75f + s * 0.25f).coerceIn(0f, 1f)
     }
 
     private fun sharpChannel(
