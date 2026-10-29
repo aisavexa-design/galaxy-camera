@@ -246,8 +246,8 @@ class ImageProcessor(private val log: (String, String, Throwable?) -> Unit) {
         return out
     }
 
-    // Sharpen, gentle gray-world white balance, luminance-only tone curve,
-    // sky and skin protection, safe saturation, and direct NV21 output.
+    // Sharpen, gray-world white balance, shadow lift, highlight protection,
+    // sky and skin handling, hue-aware saturation, and direct NV21 output.
     private fun toneAndColorNv21(src: ByteArray, w: Int, h: Int): ByteArray {
         val total = w * h
 
@@ -296,7 +296,7 @@ class ImageProcessor(private val log: (String, String, Throwable?) -> Unit) {
                 var g = (sharpChannel(src, w, ya, yb, xa, xb, count, i, 1, amount) / 255f * gainG).coerceIn(0f, 1f)
                 var b = (sharpChannel(src, w, ya, yb, xa, xb, count, i, 2, amount) / 255f * gainB).coerceIn(0f, 1f)
 
-                // Brightness of this pixel, and its colour info.
+                // Brightness and colour info of this pixel.
                 val y0 = 0.299f * r + 0.587f * g + 0.114f * b
                 val mx0 = max(r, max(g, b))
                 val mn0 = min(r, min(g, b))
@@ -305,16 +305,17 @@ class ImageProcessor(private val log: (String, String, Throwable?) -> Unit) {
                 val sky = isSky(r, g, b, y0)
                 val skin = isSkin(hue, d0, y0)
 
-                // Tone curve on brightness only, so colours are not washed out.
+                // Brightness curve: lift shadows and midtones, roll off highlights.
                 var ratio = if (y0 > 0.0001f) toneY(y0) / y0 else 1f
+                ratio = min(ratio, 1.6f)
                 if (sky && ratio > 1f) ratio = 1f
-                if (skin && y0 < 0.45f) ratio = max(ratio, 1.06f)
+                if (skin && y0 < 0.6f) ratio *= 1.08f
 
                 r *= ratio
                 g *= ratio
                 b *= ratio
 
-                // Soft clip: scale down together so the hue stays the same.
+                // Soft clip: scale all channels together so the hue stays the same.
                 val peak = max(r, max(g, b))
                 if (peak > 1f) {
                     r /= peak
@@ -322,8 +323,8 @@ class ImageProcessor(private val log: (String, String, Throwable?) -> Unit) {
                     b /= peak
                 }
 
-                // Saturation: strong on chosen colours, sky a little, skin and
-                // near-white left alone.
+                // Saturation: strong on chosen colours, a little on sky,
+                // untouched on skin and near-white.
                 val yy = 0.299f * r + 0.587f * g + 0.114f * b
                 var sat = 1.0f
                 if (sky) {
@@ -361,12 +362,15 @@ class ImageProcessor(private val log: (String, String, Throwable?) -> Unit) {
         return out
     }
 
-    // Highlights are rolled off above 0.8, then a gentle S-curve for contrast.
+    // Gamma 0.8 lifts shadows and midtones (hair, hand shadows).
+    // Above 0.85 the highlights are rolled off gently so sky and white stay clean.
     private fun toneY(v: Float): Float {
-        var x = v.coerceIn(0f, 1f)
-        if (x > 0.8f) x = 0.8f + (x - 0.8f) * 0.6f
-        val s = x * x * (3f - 2f * x)
-        return (x * 0.7f + s * 0.3f).coerceIn(0f, 1f)
+        val x = v.coerceIn(0f, 1f)
+        return if (x <= 0.85f) {
+            Math.pow(x.toDouble(), 0.8).toFloat()
+        } else {
+            (0.878f + (x - 0.85f) * 0.5f).coerceIn(0f, 1f)
+        }
     }
 
     // Blue sky: blue clearly dominates and the pixel is reasonably bright.
