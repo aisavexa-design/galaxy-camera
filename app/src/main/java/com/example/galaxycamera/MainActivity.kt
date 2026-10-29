@@ -71,11 +71,19 @@ class MainActivity : Activity() {
     private var sensorOrientation = 90
     private var previewSize = Size(1440, 1080)
 
+    // Camera selection: rear and front IDs, and which one is active now.
+    private var rearId: String? = null
+    private var frontId: String? = null
+    private var cameraId: String? = null
+    private var isFront = false
+    private var framesPerBurst = 10
+
     private var backgroundThread: HandlerThread? = null
     private var backgroundHandler: Handler? = null
     private var backgroundExecutor: ExecutorService? = null
 
     private var currentBurstDir: File? = null
+    private var currentBurstTotal = 10
     private val burstFrameCount = AtomicInteger(0)
     private val burstInProgress = AtomicBoolean(false)
     private val burstId = AtomicInteger(0)
@@ -302,7 +310,7 @@ class MainActivity : Activity() {
         rootView.addView(textureView, textureParams)
 
         toastText = TextView(this).apply {
-            text = "Saved 10 frames"
+            text = "Saved"
             setTextColor(Color.WHITE)
             typeface = Typeface.DEFAULT
             textSize = 16f
@@ -349,11 +357,17 @@ class MainActivity : Activity() {
         galleryParams.topMargin = (screenH * 0.829f - gallerySize / 2f).toInt()
         rootView.addView(galleryView, galleryParams)
 
+        // Flip button (right side): switches between rear and front camera.
         val flipSize = (screenW * 0.133f).toInt()
         val flipView = CircleView(this, Color.parseColor("#2B2B2B"))
         val flipParams = FrameLayout.LayoutParams(flipSize, flipSize)
         flipParams.leftMargin = (screenW * 0.84f - flipSize / 2f).toInt()
         flipParams.topMargin = (screenH * 0.829f - flipSize / 2f).toInt()
+        flipView.setOnClickListener {
+            flipView.animate().rotationBy(180f).setDuration(250)
+                .setInterpolator(OvershootInterpolator()).start()
+            switchCamera()
+        }
         rootView.addView(flipView, flipParams)
 
         val dbg = TextView(this).apply {
@@ -413,6 +427,45 @@ class MainActivity : Activity() {
     }
 
     // ------------------------------------------------------------------
+    // Camera selection
+    // ------------------------------------------------------------------
+
+    // Finds the rear and front camera IDs once. Rear prefers ID "0".
+    private fun pickCameraIds() {
+        if (rearId != null || frontId != null) return
+        val manager = getSystemService(Context.CAMERA_SERVICE) as CameraManager
+        try {
+            for (id in manager.cameraIdList) {
+                val facing = manager.getCameraCharacteristics(id)
+                    .get(CameraCharacteristics.LENS_FACING) ?: continue
+                if (facing == CameraCharacteristics.LENS_FACING_BACK) {
+                    if (rearId == null || id == "0") rearId = id
+                } else if (facing == CameraCharacteristics.LENS_FACING_FRONT) {
+                    if (frontId == null) frontId = id
+                }
+            }
+        } catch (e: Throwable) {
+            logError("pickCameraIds", e)
+        }
+        if (rearId == null) rearId = "0"
+    }
+
+    private fun switchCamera() {
+        if (!uiReady) return
+        pickCameraIds()
+        val target = if (isFront) rearId else frontId
+        if (target == null) {
+            showToast("Front camera not found")
+            return
+        }
+        closeCamera()
+        isFront = !isFront
+        cameraId = target
+        framesPerBurst = if (isFront) 6 else 10
+        openCamera()
+    }
+
+    // ------------------------------------------------------------------
     // Camera
     // ------------------------------------------------------------------
 
@@ -447,11 +500,16 @@ class MainActivity : Activity() {
         if (checkSelfPermission(Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) return
         if (cameraDevice != null || cameraOpening) return
         if (backgroundHandler == null) startBackgroundThread()
+        pickCameraIds()
+
+        val id = cameraId ?: rearId ?: "0"
+        cameraId = id
+        framesPerBurst = if (isFront) 6 else 10
 
         cameraOpening = true
         val manager = getSystemService(Context.CAMERA_SERVICE) as CameraManager
         try {
-            val chars = manager.getCameraCharacteristics("0")
+            val chars = manager.getCameraCharacteristics(id)
             sensorOrientation = chars.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 90
             val map = chars.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
 
@@ -465,7 +523,7 @@ class MainActivity : Activity() {
             imageReader = ImageReader.newInstance(captureSize.width, captureSize.height, format, 12).apply {
                 setOnImageAvailableListener(onImageAvailableListener, backgroundHandler)
             }
-            manager.openCamera("0", stateCallback, backgroundHandler)
+            manager.openCamera(id, stateCallback, backgroundHandler)
         } catch (e: Throwable) {
             cameraOpening = false
             logError("openCamera", e)
@@ -571,6 +629,7 @@ class MainActivity : Activity() {
                 return
             }
 
+            val total = framesPerBurst
             val builder = device.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE)
             builder.addTarget(reader.surface)
             builder.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
@@ -581,12 +640,13 @@ class MainActivity : Activity() {
             }
 
             val requests = ArrayList<CaptureRequest>()
-            for (i in 0 until 10) requests.add(builder.build())
+            for (i in 0 until total) requests.add(builder.build())
 
             val timestamp = System.currentTimeMillis()
             val dir = File(getExternalFilesDir(null) ?: filesDir, "burst/" + timestamp)
             dir.mkdirs()
             currentBurstDir = dir
+            currentBurstTotal = total
             burstFrameCount.set(0)
 
             session.captureBurst(requests, burstCallback, backgroundHandler)
@@ -613,9 +673,10 @@ class MainActivity : Activity() {
         if (image == null) return@OnImageAvailableListener
 
         val dir = currentBurstDir
+        val total = currentBurstTotal
         val count = burstFrameCount.incrementAndGet()
         val executor = backgroundExecutor
-        if (dir == null || count > 10 || executor == null) {
+        if (dir == null || count > total || executor == null) {
             image.close()
             return@OnImageAvailableListener
         }
@@ -624,8 +685,8 @@ class MainActivity : Activity() {
             executor.execute {
                 try {
                     saveFrame(image, count, dir)
-                    if (count == 10) {
-                        processBurst(dir)
+                    if (count == total) {
+                        processBurst(dir, total)
                     }
                 } catch (e: Throwable) {
                     logError("saveFrame " + count, e)
@@ -634,7 +695,7 @@ class MainActivity : Activity() {
                         image.close()
                     } catch (e: Throwable) {
                     }
-                    if (count == 10) burstInProgress.set(false)
+                    if (count == total) burstInProgress.set(false)
                 }
             }
         } catch (e: Throwable) {
@@ -658,9 +719,9 @@ class MainActivity : Activity() {
         applyExifOrientation(file)
     }
 
-    private fun processBurst(dir: File) {
+    private fun processBurst(dir: File, total: Int) {
         try {
-            val frames = (1..10)
+            val frames = (1..total)
                 .map { File(dir, String.format(Locale.US, "frame_%02d.jpg", it)) }
                 .filter { it.exists() }
             if (frames.isEmpty()) {
