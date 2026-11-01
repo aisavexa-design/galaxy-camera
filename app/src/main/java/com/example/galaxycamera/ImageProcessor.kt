@@ -1,5 +1,6 @@
 package com.example.galaxycamera
 
+import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.BitmapRegionDecoder
@@ -12,7 +13,10 @@ import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
 
-class ImageProcessor(private val log: (String, String, Throwable?) -> Unit) {
+class ImageProcessor(
+    private val context: Context,
+    private val log: (String, String, Throwable?) -> Unit
+) {
 
     class Result(val file: File, val usedFallback: Boolean)
 
@@ -23,9 +27,10 @@ class ImageProcessor(private val log: (String, String, Throwable?) -> Unit) {
         private const val BAND = 128
         private const val GHOST_THRESH = 40
         private const val ALIGN_MAX_ERR = 30.0
+        private const val MODEL_NAME = "selfie_segmenter.tflite"
     }
 
-    fun process(frames: List<File>, outFile: File): Result {
+    fun process(frames: List<File>, outFile: File, portrait: Boolean = false): Result {
         var fallbackIdx = 0
         try {
             val g4 = frames.map { loadGray(it, 4) }
@@ -96,7 +101,10 @@ class ImageProcessor(private val log: (String, String, Throwable?) -> Unit) {
                         ?: throw IllegalStateException("region decoder failed")
                 }
                 log("merge", "start merging " + aligned.size + " frames", null)
-                val nv21 = toneAndColorNv21(mergeBands(aligned, best, decs, fullW, fullH), fullW, fullH)
+                var nv21 = toneAndColorNv21(mergeBands(aligned, best, decs, fullW, fullH), fullW, fullH)
+                if (portrait) {
+                    nv21 = applyPortraitBlur(nv21, fullW, fullH, frames[best])
+                }
                 val yuv = YuvImage(nv21, ImageFormat.NV21, fullW, fullH, null)
                 FileOutputStream(outFile).use { yuv.compressToJpeg(Rect(0, 0, fullW, fullH), 95, it) }
             } finally {
@@ -113,6 +121,131 @@ class ImageProcessor(private val log: (String, String, Throwable?) -> Unit) {
             }
             return Result(outFile, true)
         }
+    }
+
+    // Portrait blur: segment the person with the selfie model, then blur the
+    // background (Y channel only, so colours stay the same). If the model is
+    // missing or fails, the image is returned unchanged.
+    private fun applyPortraitBlur(nv21: ByteArray, w: Int, h: Int, refFile: File): ByteArray {
+        try {
+            val mask = personMask(refFile, w, h) ?: return nv21
+            val out = nv21.copyOf()
+            val blurred = boxBlur(nv21, w, h, 12)
+            for (y in 0 until h) {
+                for (x in 0 until w) {
+                    val i = y * w + x
+                    val m = mask[i] / 255f
+                    val v = nv21[i].toInt() and 0xFF
+                    val b = blurred[i].toInt() and 0xFF
+                    out[i] = (v * m + b * (1f - m) + 0.5f).toInt().coerceIn(0, 255).toByte()
+                }
+            }
+            log("portrait", "background blurred", null)
+            return out
+        } catch (e: Throwable) {
+            log("portrait", "blur skipped", e)
+            return nv21
+        }
+    }
+
+    // Runs the selfie model on the reference frame and returns a w*h mask (0 = background, 255 = person).
+    // Returns null if the model file is not in assets.
+    private fun personMask(refFile: File, w: Int, h: Int): IntArray? {
+        val model = try {
+            context.assets.open(MODEL_NAME).use { it.readBytes() }
+        } catch (e: Throwable) {
+            log("portrait", "model not found in assets", e)
+            return null
+        }
+        val bmp = BitmapFactory.decodeFile(refFile.absolutePath) ?: return null
+        val small = Bitmap.createScaledBitmap(bmp, 256, 256, true)
+        bmp.recycle()
+        val input = java.nio.ByteBuffer.allocateDirect(256 * 256 * 3 * 4)
+        input.order(java.nio.ByteOrder.nativeOrder())
+        val px = IntArray(256 * 256)
+        small.getPixels(px, 0, 256, 0, 0, 256, 256)
+        small.recycle()
+        for (c in px) {
+            input.putFloat(((c shr 16) and 0xFF) / 255f)
+            input.putFloat(((c shr 8) and 0xFF) / 255f)
+            input.putFloat((c and 0xFF) / 255f)
+        }
+        input.rewind()
+
+        val interpreter = org.tensorflow.lite.Interpreter(
+            java.nio.ByteBuffer.wrap(model).let { buf ->
+                val direct = java.nio.ByteBuffer.allocateDirect(model.size)
+                direct.order(java.nio.ByteOrder.nativeOrder())
+                direct.put(buf)
+                direct.rewind()
+                direct
+            }
+        )
+        try {
+            val outBuf = Array(1) { Array(256) { Array(256) { FloatArray(1) } } }
+            interpreter.run(input, outBuf)
+            val raw = IntArray(w * h)
+            for (y in 0 until h) {
+                val sy = (y * 256 / h).coerceIn(0, 255)
+                for (x in 0 until w) {
+                    val sx = (x * 256 / w).coerceIn(0, 255)
+                    val conf = outBuf[0][sy][sx][0]
+                    raw[y * w + x] = if (conf > 0.5f) 255 else 0
+                }
+            }
+            return raw
+        } finally {
+            interpreter.close()
+        }
+    }
+
+    // Simple box blur on a single-channel (Y) plane.
+    private fun boxBlur(src: ByteArray, w: Int, h: Int, radius: Int): ByteArray {
+        val tmp = ByteArray(w * h)
+        val dst = ByteArray(w * h)
+        for (y in 0 until h) {
+            var sum = 0
+            var cnt = 0
+            for (x in 0..min(radius, w - 1)) {
+                sum += src[y * w + x].toInt() and 0xFF
+                cnt++
+            }
+            for (x in 0 until w) {
+                tmp[y * w + x] = (sum / cnt).toByte()
+                val addX = x + radius + 1
+                val remX = x - radius
+                if (addX < w) {
+                    sum += src[y * w + addX].toInt() and 0xFF
+                    cnt++
+                }
+                if (remX >= 0) {
+                    sum -= src[y * w + remX].toInt() and 0xFF
+                    cnt--
+                }
+            }
+        }
+        for (x in 0 until w) {
+            var sum = 0
+            var cnt = 0
+            for (y in 0..min(radius, h - 1)) {
+                sum += tmp[y * w + x].toInt() and 0xFF
+                cnt++
+            }
+            for (y in 0 until h) {
+                dst[y * w + x] = (sum / cnt).toByte()
+                val addY = y + radius + 1
+                val remY = y - radius
+                if (addY < h) {
+                    sum += tmp[addY * w + x].toInt() and 0xFF
+                    cnt++
+                }
+                if (remY >= 0) {
+                    sum -= tmp[remY * w + x].toInt() and 0xFF
+                    cnt--
+                }
+            }
+        }
+        return dst
     }
 
     private fun loadGray(file: File, sample: Int): Gray {
@@ -199,7 +332,6 @@ class ImageProcessor(private val log: (String, String, Throwable?) -> Unit) {
         return out
     }
 
-    // Merges aligned frames band by band into an RGB buffer (w*h*3 bytes).
     private fun mergeBands(
         aligned: List<Shift>,
         refIdx: Int,
@@ -246,12 +378,10 @@ class ImageProcessor(private val log: (String, String, Throwable?) -> Unit) {
         return out
     }
 
-    // Exposure control from the brightness histogram, neutral white balance,
-    // gentle contrast, haze control, warm-skin fix, sharpening, saturation, NV21 output.
+    // Colour and tone pipeline. Works on the RGB buffer and writes NV21.
     private fun toneAndColorNv21(src: ByteArray, w: Int, h: Int): ByteArray {
         val total = w * h
 
-        // Pass 1: white balance from neutral pixels, and a brightness histogram.
         var sumR = 0L
         var sumG = 0L
         var sumB = 0L
@@ -288,8 +418,6 @@ class ImageProcessor(private val log: (String, String, Throwable?) -> Unit) {
             gainB = (mGray / mB).coerceIn(0.97f, 1.03f)
         }
 
-        // Find the 98th percentile brightness. If the bright end is blown out,
-        // scale the whole frame down so highlights land near 0.9.
         val target = (total * 0.98).toLong()
         var acc = 0L
         var p98 = 255
@@ -332,7 +460,6 @@ class ImageProcessor(private val log: (String, String, Throwable?) -> Unit) {
                 g = (g * expScale).coerceIn(0f, 1f)
                 b = (b * expScale).coerceIn(0f, 1f)
 
-                // Colour and brightness info of this pixel.
                 val y0 = 0.299f * r + 0.587f * g + 0.114f * b
                 val mx0 = max(r, max(g, b))
                 val mn0 = min(r, min(g, b))
@@ -343,13 +470,11 @@ class ImageProcessor(private val log: (String, String, Throwable?) -> Unit) {
                 val green = d0 > 0.05f && hue >= 70f && hue <= 170f
                 val pinkCast = d0 > 0.04f && hue >= 280f && hue <= 350f
 
-                // Warm skin fix: a little less red, a little more blue.
                 if (skin) {
                     r *= 0.97f
                     b *= 1.02f
                 }
 
-                // Pink cast removal on ground and twigs.
                 if (pinkCast && !skin) {
                     val m = (r + g + b) / 3f
                     r = m + (r - m) * 0.7f
@@ -357,7 +482,6 @@ class ImageProcessor(private val log: (String, String, Throwable?) -> Unit) {
                     b = m + (b - m) * 0.7f
                 }
 
-                // Shadow lift, kept small. Highlights are rolled off.
                 var ratio = if (y0 > 0.0001f) toneY(y0) / y0 else 1f
                 ratio = min(ratio, 1.15f)
                 if (sky && ratio > 1f) ratio = 1f
@@ -367,12 +491,10 @@ class ImageProcessor(private val log: (String, String, Throwable?) -> Unit) {
                 g *= ratio
                 b *= ratio
 
-                // Gentle S-curve for contrast, so the image does not look flat or washed.
                 r = sCurve(r)
                 g = sCurve(g)
                 b = sCurve(b)
 
-                // Haze control: only very bright, low-colour pixels (white glare, bright sky) are pulled down.
                 val lumNow = 0.299f * r + 0.587f * g + 0.114f * b
                 val chromaNow = max(r, max(g, b)) - min(r, min(g, b))
                 if (lumNow > 0.85f && chromaNow < 0.1f) {
@@ -382,13 +504,11 @@ class ImageProcessor(private val log: (String, String, Throwable?) -> Unit) {
                     b *= k
                 }
 
-                // Green dominance: leaves must not turn pink.
                 if (green) {
                     val rbMax = max(r, b)
                     if (g < rbMax * 1.12f) g = min(1f, rbMax * 1.12f)
                 }
 
-                // Soft clip: scale all channels together, so the hue stays the same.
                 val peak = max(r, max(g, b))
                 if (peak > 1f) {
                     r /= peak
@@ -396,7 +516,6 @@ class ImageProcessor(private val log: (String, String, Throwable?) -> Unit) {
                     b /= peak
                 }
 
-                // Saturation: green strongest, other colours a bit, skin and near-white left alone.
                 val yy = 0.299f * r + 0.587f * g + 0.114f * b
                 var sat = 1.0f
                 if (sky) {
@@ -436,7 +555,6 @@ class ImageProcessor(private val log: (String, String, Throwable?) -> Unit) {
         return out
     }
 
-    // Gentle lift for shadows and midtones, soft roll-off above 0.85.
     private fun toneY(v: Float): Float {
         val x = v.coerceIn(0f, 1f)
         return if (x <= 0.85f) {
@@ -446,18 +564,15 @@ class ImageProcessor(private val log: (String, String, Throwable?) -> Unit) {
         }
     }
 
-    // Mild S-curve: 75% linear, 25% smoothstep.
     private fun sCurve(v: Float): Float {
         val x = v.coerceIn(0f, 1f)
         val s = x * x * (3f - 2f * x)
         return (x * 0.75f + s * 0.25f).coerceIn(0f, 1f)
     }
 
-    // Blue sky: blue clearly dominates and the pixel is reasonably bright.
     private fun isSky(r: Float, g: Float, b: Float, y: Float): Boolean =
         b > r * 1.08f && b > g * 1.0f && (b - r) > 0.05f && y > 0.35f
 
-    // Skin tones: warm hue, moderate colour, mid brightness.
     private fun isSkin(hue: Float, d: Float, y: Float): Boolean =
         hue >= 8f && hue <= 50f && d >= 0.08f && d <= 0.5f && y >= 0.2f && y <= 0.9f
 
