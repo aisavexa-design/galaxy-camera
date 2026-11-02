@@ -54,6 +54,7 @@ import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
+import kotlin.math.ln
 import kotlin.math.min
 
 class MainActivity : Activity() {
@@ -65,6 +66,7 @@ class MainActivity : Activity() {
     private lateinit var toast: TextView
     private lateinit var countdown: TextView
     private lateinit var zoomLabel: TextView
+    private lateinit var zoomRuler: ZoomRulerView
     private lateinit var modeBar: LinearLayout
     private lateinit var shutter: ShutterView
     private lateinit var debugText: TextView
@@ -109,7 +111,10 @@ class MainActivity : Activity() {
     private var recordFps = 60
 
     private var imageProcessor: ImageProcessor? = null
-    private val hideZoomRunnable = Runnable { zoomLabel.animate().alpha(0f).setDuration(300).start() }
+    private val hideZoomRunnable = Runnable {
+        zoomLabel.animate().alpha(0f).setDuration(300).start()
+        zoomRuler.animate().alpha(0f).setDuration(300).start()
+    }
 
     // ---------------- Lifecycle ----------------
 
@@ -341,6 +346,13 @@ class MainActivity : Activity() {
             topMargin = dp(560)
         })
 
+        zoomRuler = ZoomRulerView(this)
+        zoomRuler.alpha = 0f
+        root.addView(zoomRuler, FrameLayout.LayoutParams(dp(300), dp(60)).apply {
+            gravity = Gravity.CENTER_HORIZONTAL
+            topMargin = dp(500)
+        })
+
         modeBar = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER
@@ -554,6 +566,10 @@ class MainActivity : Activity() {
         zoomLabel.text = String.format(Locale.US, "%.1fx", zoomLevel)
         zoomLabel.animate().cancel()
         zoomLabel.alpha = 1f
+        zoomRuler.level = zoomLevel
+        zoomRuler.invalidate()
+        zoomRuler.animate().cancel()
+        zoomRuler.alpha = 1f
         uiHandler.removeCallbacks(hideZoomRunnable)
         uiHandler.postDelayed(hideZoomRunnable, 1500L)
     }
@@ -997,6 +1013,49 @@ class MainActivity : Activity() {
                     logError("videoSave", e)
                 }
             }
+        }
+    }
+
+    // ---------------- Zoom ruler view ----------------
+
+    private class ZoomRulerView(context: Context) : View(context) {
+        var level = 1f
+        private val linePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.WHITE
+            strokeWidth = 4f
+            style = Paint.Style.STROKE
+        }
+        private val dotPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.WHITE
+            style = Paint.Style.FILL
+        }
+        private val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.WHITE
+            textSize = 26f
+            textAlign = Paint.Align.CENTER
+        }
+        private val marks = listOf(0.5f to "0.5x", 1f to "1x", 2f to "2x", 5f to "5x", 10f to "10x")
+
+        private fun posOf(z: Float): Float {
+            val lo = ln(0.5f)
+            val hi = ln(10f)
+            return ((ln(z.coerceIn(0.5f, 10f)) - lo) / (hi - lo)).coerceIn(0f, 1f)
+        }
+
+        override fun onDraw(canvas: Canvas) {
+            super.onDraw(canvas)
+            val padX = 40f
+            val y = height * 0.6f
+            val left = padX
+            val right = width - padX
+            canvas.drawLine(left, y, right, y, linePaint)
+            for ((value, label) in marks) {
+                val x = left + posOf(value) * (right - left)
+                canvas.drawLine(x, y - 12f, x, y + 12f, linePaint)
+                canvas.drawText(label, x, y - 22f, textPaint)
+            }
+            val dx = left + posOf(level) * (right - left)
+            canvas.drawCircle(dx, y, 14f, dotPaint)
         }
     }
 
