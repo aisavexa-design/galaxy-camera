@@ -99,16 +99,16 @@ class MainActivity : Activity() {
     private var pendingRestart = false
 
     // Settings (saved in SharedPreferences)
-    private var flashMode = 0          // 0 off, 1 on at capture, 2 torch
-    private var timerSec = 0           // 0, 3, 10
-    private var squareMode = false     // false = 3:4, true = 1:1
-    private var highRes = true         // true = 12M, false = 3M
+    private var flashMode = 0
+    private var timerSec = 0
+    private var squareMode = false
+    private var highRes = true
     private var nightOn = false
-    private var zoomLevel = 1f         // 1x to 10x digital
-    private var useUltra = false       // true = 0.5x ultrawide
+    private var zoomLevel = 1f
+    private var useUltra = false
     private var isFront = false
     private var activeMode = "PHOTO"
-    private var video4k = false        // false = 1080p 60fps, true = 4K 30fps
+    private var video4k = false
 
     // Recording state
     private var isRecording = false
@@ -139,6 +139,7 @@ class MainActivity : Activity() {
 
     private var currentBurstDir: File? = null
     private var currentBurstTotal = 1
+    private var currentBurstPortrait = false
     private val burstFrameCount = AtomicInteger(0)
     private val burstInProgress = AtomicBoolean(false)
     private val burstId = AtomicInteger(0)
@@ -219,7 +220,6 @@ class MainActivity : Activity() {
         }
     }
 
-    // Volume keys take the photo (or start/stop video), if the setting is on.
     override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {
         if (keyCode == KeyEvent.KEYCODE_VOLUME_UP || keyCode == KeyEvent.KEYCODE_VOLUME_DOWN) {
             if (event?.repeatCount == 0 && uiReady && prefs().getBoolean("set_volume_shutter", true)) {
@@ -312,7 +312,6 @@ class MainActivity : Activity() {
     }
 
     private fun showDebug(text: String) {
-        // Debug overlay only shows when the setting is on.
         if (!prefs().getBoolean("set_debug", false)) return
         synchronized(debugLines) {
             debugLines.add(text)
@@ -409,7 +408,6 @@ class MainActivity : Activity() {
         rootView = FrameLayout(this)
         rootView.setBackgroundColor(Color.BLACK)
 
-        // Preview, with pinch zoom
         textureView = TextureView(this)
         textureView.surfaceTextureListener = surfaceTextureListener
         scaleDetector = ScaleGestureDetector(this, pinchListener)
@@ -421,7 +419,6 @@ class MainActivity : Activity() {
         textureParams.topMargin = (screenHpx * 0.081f).toInt()
         rootView.addView(textureView, textureParams)
 
-        // Toast and countdown
         toastText = TextView(this).apply {
             text = "Saved"
             setTextColor(Color.WHITE)
@@ -458,7 +455,6 @@ class MainActivity : Activity() {
         }
         rootView.addView(countdownText, countParams)
 
-        // Top icon row: flash, timer, ratio, resolution, motion, effects, face
         val iconSize = (screenWpx * 0.075f).toInt()
         val fractions = listOf(0.1f, 0.233f, 0.367f, 0.5f, 0.633f, 0.767f, 0.9f)
         iconFlash = IconView(this, "flash")
@@ -483,7 +479,6 @@ class MainActivity : Activity() {
         iconEffects.setOnClickListener { showToast("Effects is in the next step") }
         iconFace.setOnClickListener { showToast("Face is in the next step") }
 
-        // Night (moon) button at the right of the preview
         moonView = IconView(this, "moon")
         moonView.background = oval(Color.parseColor("#66333333"))
         val moonSize = (screenWpx * 0.11f).toInt()
@@ -493,7 +488,6 @@ class MainActivity : Activity() {
         moonView.setOnClickListener { toggleNight() }
         rootView.addView(moonView, moonParams)
 
-        // Zoom number label (shows while zooming)
         zoomLabel = TextView(this).apply {
             text = "1.0x"
             setTextColor(Color.WHITE)
@@ -512,7 +506,6 @@ class MainActivity : Activity() {
         }
         rootView.addView(zoomLabel, zoomLabelParams)
 
-        // Zoom ruler line (shows while zooming)
         zoomRuler = ZoomRulerView(this)
         zoomRuler.alpha = 0f
         val rulerParams = FrameLayout.LayoutParams(
@@ -524,7 +517,6 @@ class MainActivity : Activity() {
         }
         rootView.addView(zoomRuler, rulerParams)
 
-        // Zoom pill: .5 | 1x | 2
         zoomPill = buildZoomPill()
         val zoomParams = FrameLayout.LayoutParams(
             FrameLayout.LayoutParams.WRAP_CONTENT,
@@ -535,7 +527,6 @@ class MainActivity : Activity() {
         }
         rootView.addView(zoomPill, zoomParams)
 
-        // 4-dots bar (replaces the zoom pill when open)
         dotsBar = buildDotsBar()
         val dotsBarParams = FrameLayout.LayoutParams(
             FrameLayout.LayoutParams.WRAP_CONTENT,
@@ -546,7 +537,6 @@ class MainActivity : Activity() {
         }
         rootView.addView(dotsBar, dotsBarParams)
 
-        // 4-dots button
         val dotsView = IconView(this, "dots")
         dotsView.background = oval(Color.parseColor("#66333333"))
         val dotsSize = (screenWpx * 0.1f).toInt()
@@ -556,7 +546,6 @@ class MainActivity : Activity() {
         dotsView.setOnClickListener { toggleDotsBar() }
         rootView.addView(dotsView, dotsParams)
 
-        // Shutter (centre)
         val shutterSize = (screenWpx * 0.178f).toInt()
         shutterView = ShutterView(this)
         val shutterParams = FrameLayout.LayoutParams(shutterSize, shutterSize)
@@ -578,7 +567,6 @@ class MainActivity : Activity() {
         }
         rootView.addView(shutterView, shutterParams)
 
-        // Gallery (left)
         val gallerySize = (screenWpx * 0.13f).toInt()
         val galleryView = CircleView(this, Color.DKGRAY)
         val galleryParams = FrameLayout.LayoutParams(gallerySize, gallerySize)
@@ -587,7 +575,6 @@ class MainActivity : Activity() {
         galleryView.setOnClickListener { openGallery() }
         rootView.addView(galleryView, galleryParams)
 
-        // Flip (right)
         val flipSize = (screenWpx * 0.133f).toInt()
         val flipView = CircleView(this, Color.parseColor("#2B2B2B"))
         val flipParams = FrameLayout.LayoutParams(flipSize, flipSize)
@@ -600,7 +587,6 @@ class MainActivity : Activity() {
         }
         rootView.addView(flipView, flipParams)
 
-        // Mode strip: FUN | PORTRAIT | PHOTO | VIDEO | MORE
         val modeStrip = buildModeStrip()
         val modeParams = FrameLayout.LayoutParams(
             FrameLayout.LayoutParams.MATCH_PARENT,
@@ -610,7 +596,6 @@ class MainActivity : Activity() {
         }
         rootView.addView(modeStrip, modeParams)
 
-        // Debug overlay
         val dbg = TextView(this).apply {
             setTextColor(Color.parseColor("#FF9090"))
             textSize = 11f
@@ -751,7 +736,6 @@ class MainActivity : Activity() {
         updateShutter()
     }
 
-    // Highlights the preset (0.5x, 1x or 2x) that matches the current zoom.
     private fun updateZoomPill() {
         val video = activeMode == "VIDEO"
         if (zoomViews.isNotEmpty()) {
@@ -787,9 +771,10 @@ class MainActivity : Activity() {
         shutterView.invalidate()
     }
 
+    // PHOTO, PORTRAIT and VIDEO are switched here. PORTRAIT is photo mode with blur on.
     private fun onModeClicked(label: String) {
         when (label) {
-            "PHOTO", "VIDEO" -> {
+            "PHOTO", "PORTRAIT", "VIDEO" -> {
                 if (isRecording) {
                     showToast("Stop recording first")
                     return
@@ -802,6 +787,7 @@ class MainActivity : Activity() {
                     restartCamera()
                 }
                 savePrefs()
+                if (label == "PORTRAIT") showToast("Portrait: blur is applied to the photo")
             }
             "MORE" -> {
                 showMorePopup()
@@ -836,7 +822,6 @@ class MainActivity : Activity() {
 
     private fun zoomText(): String = String.format(Locale.US, "%.1fx", currentZoomValue())
 
-    // Shows the zoom number and ruler line, then hides them after a short pause.
     private fun showZoomUi() {
         zoomLabel.text = zoomText()
         zoomLabel.animate().cancel()
@@ -858,7 +843,6 @@ class MainActivity : Activity() {
         override fun onScale(d: ScaleGestureDetector): Boolean {
             if (!uiReady) return false
             if (useUltra) {
-                // Pinch out from 0.5x goes back to the main camera at 1x.
                 if (d.scaleFactor > 1f && !isRecording) {
                     useUltra = false
                     zoomLevel = 1f
@@ -1206,7 +1190,6 @@ class MainActivity : Activity() {
 
     private class VideoCfg(val w: Int, val h: Int, val fps: Int)
 
-    // Picks 1080p 60fps or 4K 30fps, with a clear fallback if the phone lacks it.
     private fun pickVideoConfig(chars: CameraCharacteristics): VideoCfg {
         val wantW = if (video4k) 3840 else 1920
         val wantH = if (video4k) 2160 else 1080
@@ -1269,7 +1252,6 @@ class MainActivity : Activity() {
         }
     }
 
-    // restartPreview = true brings back the normal photo preview afterwards.
     private fun stopRecording(restartPreview: Boolean) {
         if (!isRecording) return
         isRecording = false
@@ -1358,7 +1340,6 @@ class MainActivity : Activity() {
     // Camera selection
     // ------------------------------------------------------------------
 
-    // Finds rear (ID "0"), front, and ultrawide (shortest focal back camera).
     private fun pickCameraIds() {
         if (rearId != null) return
         val manager = getSystemService(Context.CAMERA_SERVICE) as CameraManager
@@ -1501,7 +1482,6 @@ class MainActivity : Activity() {
         }
     }
 
-    // Applies focus, flash, torch, zoom crop and night exposure to any request builder.
     private fun applyCommon(b: CaptureRequest.Builder) {
         b.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
         b.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON)
@@ -1512,7 +1492,6 @@ class MainActivity : Activity() {
         if (chars != null) applyCrop(b, chars)
     }
 
-    // Always sets the crop region, so going back to 1x restores the full frame.
     private fun applyCrop(b: CaptureRequest.Builder, chars: CameraCharacteristics) {
         val arr = chars.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE) ?: return
         val z = if (useUltra) 1f else zoomLevel.coerceIn(1f, 10f)
@@ -1530,7 +1509,6 @@ class MainActivity : Activity() {
         return min(6, range.upper)
     }
 
-    // Builds the session: preview + photo reader normally, or preview + recorder while recording.
     private fun createCameraPreviewSession() {
         try {
             val device = cameraDevice ?: return
@@ -1600,7 +1578,6 @@ class MainActivity : Activity() {
         }
     }
 
-    // Re-sends the live request so flash, torch, zoom and night apply at once.
     private fun applyPreviewSettings() {
         val b = previewBuilder ?: return
         val s = captureSession ?: return
@@ -1656,6 +1633,7 @@ class MainActivity : Activity() {
             dir.mkdirs()
             currentBurstDir = dir
             currentBurstTotal = total
+            currentBurstPortrait = activeMode == "PORTRAIT"
             burstFrameCount.set(0)
 
             session.captureBurst(requests, burstCallback, backgroundHandler)
@@ -1668,10 +1646,6 @@ class MainActivity : Activity() {
             logError("captureBurst", e)
         }
     }
-
-    // ------------------------------------------------------------------
-    // Saving frames and processing
-    // ------------------------------------------------------------------
 
     private val onImageAvailableListener = ImageReader.OnImageAvailableListener { reader ->
         val image: Image? = try {
@@ -1695,7 +1669,7 @@ class MainActivity : Activity() {
                 try {
                     saveFrame(image, count, dir)
                     if (count == total) {
-                        processBurst(dir, total)
+                        processBurst(dir, total, currentBurstPortrait)
                     }
                 } catch (e: Throwable) {
                     logError("saveFrame " + count, e)
@@ -1728,7 +1702,7 @@ class MainActivity : Activity() {
         applyExifOrientation(file)
     }
 
-    private fun processBurst(dir: File, total: Int) {
+    private fun processBurst(dir: File, total: Int, portrait: Boolean) {
         try {
             val frames = (1..total)
                 .map { File(dir, String.format(Locale.US, "frame_%02d.jpg", it)) }
@@ -1737,15 +1711,16 @@ class MainActivity : Activity() {
                 logMsg("process", "no frames found")
                 return
             }
-            showToast("Processing...")
+            showToast(if (portrait) "Processing portrait..." else "Processing...")
 
             val enhDir = File(getExternalFilesDir(null) ?: filesDir, "enhanced")
             enhDir.mkdirs()
-            val outName = "GC_" + System.currentTimeMillis() + "_enhanced.jpg"
+            val outName = "GC_" + System.currentTimeMillis() + (if (portrait) "_portrait" else "") + "_enhanced.jpg"
             val outFile = File(enhDir, outName)
 
-            val processor = imageProcessor ?: ImageProcessor(processorLog).also { imageProcessor = it }
-            val result = processor.process(frames, outFile)
+            val processor = imageProcessor
+                ?: ImageProcessor(applicationContext, processorLog).also { imageProcessor = it }
+            val result = processor.process(frames, outFile, portrait)
 
             applyExifOrientation(result.file)
             saveToGallery(result.file.readBytes(), outName)
@@ -1887,8 +1862,6 @@ class MainActivity : Activity() {
         }
     }
 
-    // Horizontal zoom line with marks at 0.5x, 1x, 2x, 5x, 10x, and a dot at the current zoom.
-    // The scale is logarithmic, so 1x to 2x takes the same space as 2x to 4x.
     private class ZoomRulerView(context: Context) : View(context) {
         var level = 1f
         private val linePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
@@ -1930,7 +1903,6 @@ class MainActivity : Activity() {
         }
     }
 
-    // Shutter: solid white for photo. In video it shows a red dot, or a red square while recording.
     private class ShutterView(context: Context) : View(context) {
         var videoMode = false
         var recording = false
@@ -1962,8 +1934,11 @@ class MainActivity : Activity() {
         }
     }
 
-    // Line icons drawn with Canvas. state and label change how they look.
     private class IconView(context: Context, private val kind: String) : View(context) {
+        var state = 0
+        var label = ""
+        private val p = Paint(Paint.ANTI_ALI
+                                  private class IconView(context: Context, private val kind: String) : View(context) {
         var state = 0
         var label = ""
         private val p = Paint(Paint.ANTI_ALIAS_FLAG).apply {
@@ -2073,4 +2048,4 @@ class MainActivity : Activity() {
             p.typeface = Typeface.DEFAULT
         }
     }
-}
+                              }
