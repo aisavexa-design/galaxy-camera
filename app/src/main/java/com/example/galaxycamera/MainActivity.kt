@@ -12,7 +12,9 @@ import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.ImageFormat
 import android.graphics.Paint
+import android.graphics.Path
 import android.graphics.Rect
+import android.graphics.RectF
 import android.graphics.SurfaceTexture
 import android.graphics.Typeface
 import android.graphics.YuvImage
@@ -70,8 +72,20 @@ class MainActivity : Activity() {
     private lateinit var modeBar: LinearLayout
     private lateinit var shutter: ShutterView
     private lateinit var debugText: TextView
+    private lateinit var zoomPill: LinearLayout
+    private lateinit var dotsBar: LinearLayout
+    private lateinit var iconFlash: IconView
+    private lateinit var iconTimer: IconView
+    private lateinit var iconRatio: IconView
+    private lateinit var iconRes: IconView
+    private lateinit var dotFlash: IconView
+    private lateinit var dotTimer: IconView
+    private lateinit var dotRatio: IconView
+    private lateinit var dotRes: IconView
     private val modeViews = ArrayList<TextView>()
+    private val zoomViews = ArrayList<TextView>()
 
+    private var dotsVisible = false
     private var uiReady = false
     private var flashMode = 0
     private var timerSec = 0
@@ -289,6 +303,11 @@ class MainActivity : Activity() {
         cornerRadius = radius
     }
 
+    private fun oval(color: Int) = GradientDrawable().apply {
+        shape = GradientDrawable.OVAL
+        setColor(color)
+    }
+
     private fun buildUi() {
         root = FrameLayout(this)
         root.setBackgroundColor(Color.BLACK)
@@ -310,6 +329,30 @@ class MainActivity : Activity() {
         }
         root.addView(debugText, FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.WRAP_CONTENT).apply {
             topMargin = dp(60)
+        })
+
+        // Top icon row: flash, timer, ratio, resolution
+        val topIcons = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER
+        }
+        iconFlash = IconView(this, "flash")
+        iconTimer = IconView(this, "timer")
+        iconRatio = IconView(this, "ratio")
+        iconRes = IconView(this, "res")
+        iconFlash.setOnClickListener { cycleFlash() }
+        iconTimer.setOnClickListener { cycleTimer() }
+        iconRatio.setOnClickListener { toggleRatio() }
+        iconRes.setOnClickListener { toggleResolution() }
+        for (v in listOf(iconFlash, iconTimer, iconRatio, iconRes)) {
+            topIcons.addView(v, LinearLayout.LayoutParams(dp(44), dp(44)).apply {
+                leftMargin = dp(10)
+                rightMargin = dp(10)
+            })
+        }
+        root.addView(topIcons, FrameLayout.LayoutParams(FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT).apply {
+            gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL
+            topMargin = dp(40)
         })
 
         toast = TextView(this).apply {
@@ -351,6 +394,68 @@ class MainActivity : Activity() {
         root.addView(zoomRuler, FrameLayout.LayoutParams(dp(300), dp(60)).apply {
             gravity = Gravity.CENTER_HORIZONTAL
             topMargin = dp(500)
+        })
+
+        // Zoom pills: .5x, 1x, 2x
+        zoomPill = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER
+            background = roundRect(Color.parseColor("#66333333"), dp(30).toFloat())
+        }
+        val zoomLabels = listOf(".5", "1x", "2")
+        val zoomValues = listOf(0.5f, 1f, 2f)
+        for (i in zoomLabels.indices) {
+            val tv = TextView(this).apply {
+                text = zoomLabels[i]
+                textSize = 15f
+                setTextColor(Color.WHITE)
+                gravity = Gravity.CENTER
+                setOnClickListener { setZoom(zoomValues[i]) }
+            }
+            zoomViews.add(tv)
+            zoomPill.addView(tv, LinearLayout.LayoutParams(dp(44), dp(44)))
+        }
+        root.addView(zoomPill, FrameLayout.LayoutParams(FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT).apply {
+            gravity = Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL
+            bottomMargin = dp(290)
+        })
+
+        // 4-dots bar (gear, flash, timer, ratio, res, close)
+        dotsBar = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER
+            background = roundRect(Color.parseColor("#CC333333"), dp(30).toFloat())
+            visibility = View.GONE
+        }
+        val gear = IconView(this, "gear")
+        dotFlash = IconView(this, "flash")
+        dotTimer = IconView(this, "timer")
+        dotRatio = IconView(this, "ratio")
+        dotRes = IconView(this, "res")
+        val close = IconView(this, "close")
+        gear.setOnClickListener { startActivity(Intent(this, SettingsActivity::class.java)) }
+        dotFlash.setOnClickListener { cycleFlash() }
+        dotTimer.setOnClickListener { cycleTimer() }
+        dotRatio.setOnClickListener { toggleRatio() }
+        dotRes.setOnClickListener { toggleResolution() }
+        close.setOnClickListener { hideDotsBar() }
+        for (v in listOf(gear, dotFlash, dotTimer, dotRatio, dotRes, close)) {
+            dotsBar.addView(v, LinearLayout.LayoutParams(dp(44), dp(44)))
+        }
+        root.addView(dotsBar, FrameLayout.LayoutParams(FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT).apply {
+            gravity = Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL
+            bottomMargin = dp(290)
+        })
+
+        // Button that opens the 4-dots bar (shows at the right of the zoom pill)
+        val dotsBtn = IconView(this, "dots").apply {
+            background = oval(Color.parseColor("#66333333"))
+            setOnClickListener { toggleDotsBar() }
+        }
+        root.addView(dotsBtn, FrameLayout.LayoutParams(dp(44), dp(44)).apply {
+            gravity = Gravity.BOTTOM or Gravity.END
+            rightMargin = dp(24)
+            bottomMargin = dp(290)
         })
 
         modeBar = LinearLayout(this).apply {
@@ -402,24 +507,23 @@ class MainActivity : Activity() {
             bottomMargin = dp(96)
         })
 
-        val topBar = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER
-        }
-        val flashBtn = Button(this).apply { text = "Flash"; setOnClickListener { cycleFlash() } }
-        val timerBtn = Button(this).apply { text = "Timer"; setOnClickListener { cycleTimer() } }
-        val ratioBtn = Button(this).apply { text = "3:4"; setOnClickListener { toggleRatio() } }
-        val resBtn = Button(this).apply { text = "12M"; setOnClickListener { toggleResolution() } }
-        val nightBtn = Button(this).apply { text = "Night"; setOnClickListener { toggleNight() } }
-        for (b in listOf(flashBtn, timerBtn, ratioBtn, resBtn, nightBtn)) {
-            topBar.addView(b, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
-        }
-        root.addView(topBar, FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.WRAP_CONTENT).apply {
-            gravity = Gravity.TOP
-            topMargin = dp(40)
-        })
-
         setContentView(root)
+    }
+
+    private fun toggleDotsBar() {
+        if (dotsBar.visibility == View.VISIBLE) hideDotsBar() else showDotsBar()
+    }
+
+    private fun showDotsBar() {
+        zoomPill.visibility = View.GONE
+        dotsBar.visibility = View.VISIBLE
+        dotsBar.alpha = 0f
+        dotsBar.animate().alpha(1f).setDuration(200).start()
+    }
+
+    private fun hideDotsBar() {
+        dotsBar.visibility = View.GONE
+        zoomPill.visibility = View.VISIBLE
     }
 
     private fun updateUi() {
@@ -429,6 +533,35 @@ class MainActivity : Activity() {
             val selected = modes[i] == activeMode
             tv.setTextColor(if (selected) Color.WHITE else Color.parseColor("#888888"))
             tv.typeface = if (selected) Typeface.DEFAULT_BOLD else Typeface.DEFAULT
+        }
+        val timerLabel = if (timerSec == 0) "" else timerSec.toString()
+        val ratioLabel = if (squareMode) "1:1" else "3:4"
+        val resLabel = if (activeMode == "VIDEO") {
+            if (video4k) "4K30" else "FHD60"
+        } else {
+            if (highRes) "12M" else "3M"
+        }
+        for (v in listOf(iconFlash, dotFlash)) {
+            v.state = flashMode
+            v.invalidate()
+        }
+        for (v in listOf(iconTimer, dotTimer)) {
+            v.label = timerLabel
+            v.invalidate()
+        }
+        for (v in listOf(iconRatio, dotRatio)) {
+            v.label = ratioLabel
+            v.invalidate()
+        }
+        for (v in listOf(iconRes, dotRes)) {
+            v.label = resLabel
+            v.invalidate()
+        }
+        for (i in zoomViews.indices) {
+            val z = listOf(0.5f, 1f, 2f)[i]
+            val selected = abs(zoomLevel - z) < 0.05f
+            zoomViews[i].background = if (selected) oval(Color.parseColor("#AA777777")) else null
+            zoomViews[i].alpha = if (selected) 1f else 0.75f
         }
         shutter.videoMode = activeMode == "VIDEO"
         shutter.recording = isRecording
@@ -512,6 +645,7 @@ class MainActivity : Activity() {
         flashMode = (flashMode + 1) % 3
         savePrefs()
         applyPreview()
+        updateUi()
         showToast("Flash " + listOf("off", "on", "torch")[flashMode])
     }
 
@@ -522,6 +656,7 @@ class MainActivity : Activity() {
             else -> 0
         }
         savePrefs()
+        updateUi()
         showToast(if (timerSec == 0) "Timer off" else "Timer " + timerSec + "s")
     }
 
@@ -536,6 +671,7 @@ class MainActivity : Activity() {
         if (activeMode == "VIDEO") {
             video4k = !video4k
             savePrefs()
+            updateUi()
             showToast(if (video4k) "Video: 4K 30fps" else "Video: 1080p 60fps")
             return
         }
@@ -543,13 +679,6 @@ class MainActivity : Activity() {
         highRes = !highRes
         savePrefs()
         restartCamera()
-    }
-
-    private fun toggleNight() {
-        nightOn = !nightOn
-        savePrefs()
-        applyPreview()
-        showToast(if (nightOn) "Night on" else "Night off")
     }
 
     private fun switchCamera() {
@@ -561,6 +690,14 @@ class MainActivity : Activity() {
     }
 
     // ---------------- Zoom ----------------
+
+    private fun setZoom(z: Float) {
+        zoomLevel = z
+        savePrefs()
+        applyPreview()
+        showZoomUi()
+        updateUi()
+    }
 
     private fun showZoomUi() {
         zoomLabel.text = String.format(Locale.US, "%.1fx", zoomLevel)
@@ -579,6 +716,7 @@ class MainActivity : Activity() {
             zoomLevel = (zoomLevel * d.scaleFactor).coerceIn(1f, 10f)
             applyPreview()
             showZoomUi()
+            updateUi()
             return true
         }
 
@@ -713,7 +851,6 @@ class MainActivity : Activity() {
         openCamera()
     }
 
-    // Applies flash, torch, night exposure and zoom crop to a request.
     private fun applyCommon(b: CaptureRequest.Builder) {
         b.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
         b.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON)
@@ -1016,7 +1153,7 @@ class MainActivity : Activity() {
         }
     }
 
-    // ---------------- Zoom ruler view ----------------
+    // ---------------- Views ----------------
 
     private class ZoomRulerView(context: Context) : View(context) {
         var level = 1f
@@ -1059,7 +1196,82 @@ class MainActivity : Activity() {
         }
     }
 
-    // ---------------- Shutter view ----------------
+    private class IconView(context: Context, private val kind: String) : View(context) {
+        var state = 0
+        var label = ""
+        private val p = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.WHITE
+            style = Paint.Style.STROKE
+        }
+
+        override fun onDraw(canvas: Canvas) {
+            super.onDraw(canvas)
+            val w = width.toFloat()
+            val h = height.toFloat()
+            val cx = w / 2f
+            val cy = h / 2f
+            val r = w * 0.34f
+            p.strokeWidth = w * 0.055f
+            p.color = Color.WHITE
+            p.style = Paint.Style.STROKE
+
+            when (kind) {
+                "flash" -> {
+                    val path = Path()
+                    path.moveTo(cx + r * 0.3f, cy - r)
+                    path.lineTo(cx - r * 0.6f, cy + r * 0.15f)
+                    path.lineTo(cx - r * 0.02f, cy + r * 0.15f)
+                    path.lineTo(cx - r * 0.3f, cy + r)
+                    path.lineTo(cx + r * 0.6f, cy - r * 0.15f)
+                    path.lineTo(cx + r * 0.02f, cy - r * 0.15f)
+                    path.close()
+                    if (state == 2) p.style = Paint.Style.FILL
+                    canvas.drawPath(path, p)
+                    p.style = Paint.Style.STROKE
+                    if (state == 0) canvas.drawLine(cx - r, cy - r, cx + r, cy + r, p)
+                }
+                "timer" -> {
+                    canvas.drawCircle(cx, cy, r, p)
+                    if (label.isNotEmpty()) {
+                        drawLabel(canvas, label, cx, cy, r * 1.1f)
+                    } else {
+                        canvas.drawLine(cx, cy, cx, cy - r * 0.6f, p)
+                        canvas.drawLine(cx, cy, cx + r * 0.45f, cy, p)
+                    }
+                }
+                "ratio", "res" -> drawLabel(canvas, label, cx, cy, h * 0.36f)
+                "gear" -> {
+                    canvas.drawCircle(cx, cy, r, p)
+                    canvas.drawCircle(cx, cy, r * 0.35f, p)
+                }
+                "close" -> {
+                    canvas.drawLine(cx - r, cy - r, cx + r, cy + r, p)
+                    canvas.drawLine(cx + r, cy - r, cx - r, cy + r, p)
+                }
+                "dots" -> {
+                    p.style = Paint.Style.FILL
+                    for (dx in listOf(-0.35f, 0.35f)) {
+                        for (dy in listOf(-0.35f, 0.35f)) {
+                            canvas.drawCircle(cx + r * dx, cy + r * dy, r * 0.14f, p)
+                        }
+                    }
+                    p.style = Paint.Style.STROKE
+                }
+            }
+        }
+
+        private fun drawLabel(canvas: Canvas, text: String, x: Float, y: Float, size: Float) {
+            p.style = Paint.Style.FILL
+            p.textSize = size
+            p.textAlign = Paint.Align.CENTER
+            p.typeface = Typeface.DEFAULT_BOLD
+            val baseline = y - (p.descent() + p.ascent()) / 2f
+            canvas.drawText(text, x, baseline, p)
+            p.style = Paint.Style.STROKE
+            p.textAlign = Paint.Align.LEFT
+            p.typeface = Typeface.DEFAULT
+        }
+    }
 
     private class ShutterView(context: Context) : View(context) {
         var videoMode = false
