@@ -1820,7 +1820,7 @@ class MainActivity : Activity() {
     ): GradientDrawable {
         return GradientDrawable().apply {
             setColor(color)
-            cornerRadius = radius.dp().toFloat()
+            cornerRadius = radius
         }
     }
 
